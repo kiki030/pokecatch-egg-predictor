@@ -64,18 +64,22 @@
   // ============================================================================
   const SAVE_KEY = 'gachamon-save-v1';
   const STORAGE_KEY = 'pkc_egg_predictor_ui_v1';
+  const ID_NAME_STORAGE_KEY = 'pkc_id_to_name_v1';
   const HOST_ID = 'pkc-egg-predictor-host';
   const GOLD_STYLE_ID = 'pkc-shiny-egg-gold-style';
   const GOLD_CLASS = 'pkc-shiny-egg-gold';
   const GOLD_REL_CLASS = 'pkc-shiny-egg-rel';
-  const POLL_INTERVAL_MS = 900;
+  const POLL_INTERVAL_MS = 1200;
+
+  const LIST_TOTAL_EGGS = 1000;
+  const LIST_PAGE_SIZE = 200;
+  const CARD_SEARCH_MAX = 8000;
 
   const TIERS = [
     {
       id: 'base',
-      label: '一般',
-      shortLabel: '純素',
-      rateText: '1/512',
+      cardTitle: '普通親代 (1/512)',
+      tagName: '普通親代',
       sp: 0,
       bx: 0,
       th: shinyThreshold({ sp: 0, bx: 0 }),
@@ -83,9 +87,8 @@
     },
     {
       id: 'berry',
-      label: '一般+果',
-      shortLabel: '單果',
-      rateText: '1/256',
+      cardTitle: '吃果普通親代 (1/256)',
+      tagName: '吃果普通親代',
       sp: 0,
       bx: 1,
       th: shinyThreshold({ sp: 0, bx: 1 }),
@@ -93,9 +96,8 @@
     },
     {
       id: 'parent',
-      label: '色違親代',
-      shortLabel: '親代',
-      rateText: '1/16',
+      cardTitle: '閃光親代 (1/16)',
+      tagName: '閃光親代',
       sp: 2,
       bx: 0,
       th: shinyThreshold({ sp: 2, bx: 0 }),
@@ -103,9 +105,8 @@
     },
     {
       id: 'parentBerry',
-      label: '親代+果',
-      shortLabel: '親代+果',
-      rateText: '1/8',
+      cardTitle: '吃果閃光親代 (1/8)',
+      tagName: '吃果閃光親代',
       sp: 2,
       bx: 1,
       th: shinyThreshold({ sp: 2, bx: 1 }),
@@ -117,13 +118,21 @@
     collapsed: false,
     activeTab: 'predict', // 'predict' | 'eggs'
     filterTier: 'all', // 'all' | 'base' | 'berry' | 'parent' | 'parentBerry'
-    scanLimit: 2000,
-    manualK: null, // null = 自動推算
+    visibleCount: LIST_PAGE_SIZE,
     showDebug: false,
     pos: null // { right, bottom }
   };
 
+  // 以 uid 為 key 的純本地記憶體快取：{ name, lv, expWidth, expLabel, imgSrc, isDomImg }
+  const domPensionCache = new Map();
+
+  // 以 mon.id 為 key 的純本地寶可夢名稱快取（同步暫存於 chrome.storage.local）
+  const idToName = Object.create(null);
+  idToName[DITTO_ID] = '百變怪';
+  let idToNameDirty = false;
+
   let lastRawSave = null;
+  let lastRenderSig = null;
   let currentState = null;
   let lastDomMatchInfo = { matched: 0, totalShiny: 0 };
   let shadowRoot = null;
@@ -160,7 +169,7 @@
     if (!cur || typeof cur !== 'object') return null;
 
     for (var depth = 0; depth < 3; depth++) {
-      if (cur && typeof cur === 'object' && !cur.trainer) {
+      if (cur && typeof cur === 'object' && !cur.trainer && !cur.pension) {
         var inner = null;
         if (Object.prototype.hasOwnProperty.call(cur, 'data') && cur.data != null) {
           inner = cur.data;
@@ -189,70 +198,199 @@
   }
 
   // ============================================================================
-  // 存檔結構自動偵測（蛋陣列、下一個 k、培育屋親代）
+  // 純本地寶可夢名稱快取（idToName）與 DOM 擷取（#pen-res 與 #pen-eggs）
   // ============================================================================
-  function getByPath(obj, path) {
-    var cur = obj;
-    for (var i = 0; i < path.length; i++) {
-      if (!cur || typeof cur !== 'object') return undefined;
-      cur = cur[path[i]];
-    }
-    return cur;
+  function cleanMonName(raw) {
+    if (!raw || typeof raw !== 'string') return '';
+    return raw
+      .replace(/(?:Lv|Niv|Level)\.?\s*\d+/gi, ' ')
+      .replace(/\d+(?:\.\d+)?\s*%/g, ' ')
+      .replace(/#\s*\d+/g, ' ')
+      .replace(/[✦★☆✨🍬🥚×x+]/g, ' ')
+      .replace(/\b\d+\b/g, ' ')
+      .replace(/^(?:\s*(?:領回|取回|收回|取出|移除|孵化|Récupérer|Retirer|Retrieve|Remove|Hatch)\s*)+/i, '')
+      .replace(/(?:\s*(?:領回|取回|收回|取出|移除|孵化|Récupérer|Retirer|Retrieve|Remove|Hatch)\s*)+$/i, '')
+      .replace(/^(?:領回|取回|Récupérer)\s*/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 
-  function looksLikeEggObject(item) {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
-    if (typeof item.k === 'number' && Number.isInteger(item.k)) return true;
-    if (item.laidAt != null || item.hatchAt != null || item.hatchSteps != null) return true;
-    if (
-      (Object.prototype.hasOwnProperty.call(item, 'sp') || Object.prototype.hasOwnProperty.call(item, 'bx')) &&
-      (item.uid != null || item.species != null || item.speciesId != null || item.id != null || item.pokemonId != null)
-    ) {
-      return true;
-    }
-    return false;
+  function isValidLearnedName(name) {
+    if (!name || typeof name !== 'string') return false;
+    var s = name.trim();
+    if (!s || s.length > 16) return false;
+    if (s.indexOf('?') !== -1 || s.indexOf('？') !== -1) return false;
+    if (/^(?:未知|神秘蛋|蛋|egg|pokemon|mon|null|undefined)$/i.test(s)) return false;
+    return true;
   }
 
-  function detectEggs(save) {
-    var candidates = [
-      ['eggs'],
-      ['daycare', 'eggs'],
-      ['breeding', 'eggs'],
-      ['nursery', 'eggs'],
-      ['incubator', 'eggs'],
-      ['eggBox'],
-      ['eggStorage'],
-      ['daycareEggs']
-    ];
-
-    for (var i = 0; i < candidates.length; i++) {
-      var val = getByPath(save, candidates[i]);
-      if (Array.isArray(val)) {
-        return { eggs: val, path: 'save.' + candidates[i].join('.') };
-      }
+  function recordIdName(id, rawName) {
+    var numId = +id;
+    if (!Number.isFinite(numId) || numId <= 0) return;
+    var cleaned = cleanMonName(rawName);
+    if (!isValidLearnedName(cleaned)) return;
+    if (idToName[numId] !== cleaned) {
+      idToName[numId] = cleaned;
+      idToNameDirty = true;
     }
+  }
 
-    // 備援：淺層掃描（最多 2 層）尋找蛋物件陣列
-    var topKeys = Object.keys(save);
-    for (var a = 0; a < topKeys.length; a++) {
-      var k1 = topKeys[a];
-      var v1 = save[k1];
-      if (Array.isArray(v1) && v1.length > 0 && looksLikeEggObject(v1[0])) {
-        return { eggs: v1, path: 'save.' + k1 };
+  function flushIdToNameStorage() {
+    if (!idToNameDirty) return;
+    idToNameDirty = false;
+    try {
+      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+        var payload = {};
+        payload[ID_NAME_STORAGE_KEY] = idToName;
+        chrome.storage.local.set(payload);
       }
-      if (v1 && typeof v1 === 'object' && !Array.isArray(v1)) {
-        var subKeys = Object.keys(v1);
-        for (var b = 0; b < subKeys.length; b++) {
-          var k2 = subKeys[b];
-          var v2 = v1[k2];
-          if (Array.isArray(v2) && v2.length > 0 && looksLikeEggObject(v2[0])) {
-            return { eggs: v2, path: 'save.' + k1 + '.' + k2 };
-          }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  function refreshDomPensionInfo(pension) {
+    try {
+      // 建立當前存檔 uid -> mon.id 對照表，以便將 DOM 抓到的名稱寫入 idToName[id]
+      var uidToId = Object.create(null);
+      var rawMons = (pension && Array.isArray(pension.mons)) ? pension.mons : [];
+      for (var mIdx = 0; mIdx < rawMons.length; mIdx++) {
+        var entry = rawMons[mIdx];
+        var m = (entry && entry.mon && typeof entry.mon === 'object') ? entry.mon : entry;
+        if (m && m.uid != null && m.id != null) {
+          uidToId[String(m.uid)] = +m.id;
         }
       }
-    }
+      var rawEggs = (pension && Array.isArray(pension.eggs)) ? pension.eggs : [];
+      for (var eIdx = 0; eIdx < rawEggs.length; eIdx++) {
+        var eg = rawEggs[eIdx];
+        if (eg && eg.uid != null && eg.id != null) {
+          uidToId[String(eg.uid)] = +eg.id;
+        }
+      }
 
-    return { eggs: [], path: '未偵測' };
+      // 1. 掃描培育屋親代 DOM（#pen-res .pen-res[data-uid]）
+      var nodes = document.querySelectorAll('#pen-res .pen-res[data-uid], .pen-res[data-uid]');
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        var uid = el.getAttribute('data-uid');
+        if (!uid) continue;
+        var uidKey = String(uid);
+        var prev = domPensionCache.get(uidKey) || {
+          name: '',
+          lv: null,
+          expWidth: '',
+          expLabel: '',
+          imgSrc: '',
+          isDomImg: false
+        };
+
+        var imgEl = el.querySelector('img');
+        if (imgEl) {
+          var src = imgEl.getAttribute('src') || imgEl.src || '';
+          if (src && src.trim()) {
+            prev.imgSrc = src.trim();
+            prev.isDomImg = true;
+          }
+        }
+
+        var gaugeI = el.querySelector('.pen-gauge i, [class*="gauge"] i');
+        if (gaugeI) {
+          var w = (gaugeI.style && gaugeI.style.width) ? gaugeI.style.width.trim() : '';
+          if (!w) {
+            var styleAttr = gaugeI.getAttribute('style') || '';
+            var wMatch = styleAttr.match(/width\s*:\s*([\d.]+%)/i);
+            if (wMatch) w = wMatch[1];
+          }
+          if (w) {
+            var numPct = parseFloat(w);
+            if (Number.isFinite(numPct)) {
+              var clamped = Math.max(0, Math.min(100, numPct));
+              prev.expWidth = clamped + '%';
+              prev.expLabel = Math.round(clamped) + '%';
+            }
+          }
+        }
+
+        var fullText = el.textContent || '';
+        var lvMatch = fullText.match(/(?:Lv|Niv|Level)\.?\s*(\d+)/i);
+        if (lvMatch) {
+          var parsedLv = parseInt(lvMatch[1], 10);
+          if (Number.isFinite(parsedLv) && parsedLv > 0) {
+            prev.lv = parsedLv;
+          }
+        }
+
+        var name = '';
+        var dataName = el.getAttribute('data-name') || el.getAttribute('title');
+        if (dataName) name = cleanMonName(dataName);
+        if (!name && imgEl) {
+          var alt = cleanMonName(imgEl.getAttribute('alt') || '');
+          if (alt && !/^(mon|pokemon|egg|sprite)$/i.test(alt)) {
+            name = alt;
+          }
+        }
+        if (!name) {
+          var nameEl = el.querySelector('.name, .mon-name, .pen-name, .p-name, b, strong');
+          if (nameEl && nameEl.textContent) {
+            name = cleanMonName(nameEl.textContent);
+          }
+        }
+        if (!name && fullText) {
+          var cleaned = cleanMonName(fullText);
+          if (cleaned && cleaned.length <= 16) {
+            name = cleaned;
+          }
+        }
+        if (isValidLearnedName(name)) {
+          prev.name = name;
+          if (uidToId[uidKey]) {
+            recordIdName(uidToId[uidKey], name);
+          }
+        }
+
+        domPensionCache.set(uidKey, prev);
+      }
+
+      // 2. 掃描培育屋蛋卡 DOM（#pen-eggs .egg-mon[title]，排除 ???）
+      var eggMonNodes = document.querySelectorAll('#pen-eggs .egg-mon[title], .egg-mon[title]');
+      for (var j = 0; j < eggMonNodes.length; j++) {
+        var emEl = eggMonNodes[j];
+        var rawTitle = emEl.getAttribute('title') || '';
+        if (!rawTitle || rawTitle.indexOf('?') !== -1 || rawTitle.indexOf('？') !== -1) continue;
+        var learnedEggName = cleanMonName(rawTitle);
+        if (!isValidLearnedName(learnedEggName)) continue;
+
+        // 嘗試從自身或父層 data-uid 對照 egg.id，或依序對照 rawEggs[j]
+        var holder = emEl.closest ? emEl.closest('[data-uid], [data-egg-uid]') : null;
+        var eUid =
+          emEl.getAttribute('data-uid') ||
+          (holder && (holder.getAttribute('data-uid') || holder.getAttribute('data-egg-uid'))) ||
+          null;
+
+        var matchedEggId = null;
+        if (eUid && uidToId[String(eUid)]) {
+          matchedEggId = uidToId[String(eUid)];
+        } else if (j < rawEggs.length && rawEggs[j] && rawEggs[j].id != null) {
+          matchedEggId = +rawEggs[j].id;
+        }
+
+        if (matchedEggId) {
+          recordIdName(matchedEggId, learnedEggName);
+        }
+      }
+
+      flushIdToNameStorage();
+    } catch (e) {
+      // ignore DOM read error
+    }
+  }
+
+  // ============================================================================
+  // 存檔結構解析（save.pension.laid / eggs / mons / bx）
+  // ============================================================================
+  function getFallbackMonImg(id, shiny) {
+    return 'assets/pokemon/' + (shiny ? 'shiny/' : '') + id + '.png';
   }
 
   function evaluateEgg(egg, idx, save) {
@@ -277,24 +415,38 @@
     }
 
     var speciesId =
-      egg && (egg.speciesId != null ? egg.speciesId :
+      egg && (egg.id != null && typeof egg.id === 'number' ? egg.id :
+      egg.speciesId != null ? egg.speciesId :
       egg.pokemonId != null ? egg.pokemonId :
       egg.dexId != null ? egg.dexId :
-      egg.species != null ? egg.species :
-      egg.monId != null ? egg.monId :
-      (typeof egg.id === 'number' ? egg.id : null));
+      egg.species != null ? egg.species : null);
 
-    var name =
+    var rawName =
       egg && (egg.name || egg.speciesName || egg.zhName || egg.label || null);
+    if (speciesId != null && rawName) {
+      recordIdName(speciesId, String(rawName));
+    }
+
+    var uid = egg && egg.uid != null ? String(egg.uid) : null;
+    var cachedUid = uid ? domPensionCache.get(uid) : null;
+    var resolvedName =
+      (speciesId != null && idToName[speciesId]) ||
+      (cachedUid && cachedUid.name) ||
+      (rawName ? cleanMonName(String(rawName)) : '') ||
+      '神秘蛋';
+
+    var imgSrc = speciesId != null ? getFallbackMonImg(speciesId, isShiny) : '';
 
     return {
       index: idx,
       egg: egg,
       k: egg && typeof egg.k === 'number' && Number.isInteger(egg.k) ? egg.k : null,
-      uid: egg && egg.uid != null ? String(egg.uid) : null,
+      uid: uid,
       laidAt: egg && egg.laidAt != null ? egg.laidAt : null,
+      hatchAt: egg && egg.hatchAt != null ? egg.hatchAt : null,
       speciesId: speciesId,
-      name: name,
+      displayName: resolvedName,
+      imgSrc: imgSrc,
       sp: egg && egg.sp ? +egg.sp : 0,
       bx: !!(egg && egg.bx),
       roll: roll,
@@ -304,267 +456,356 @@
     };
   }
 
-  function detectNextK(save, evaluatedEggs) {
-    var maxEggK = null;
-    for (var i = 0; i < evaluatedEggs.length; i++) {
-      var ek = evaluatedEggs[i].k;
-      if (ek != null && (maxEggK === null || ek > maxEggK)) {
-        maxEggK = ek;
-      }
-    }
+  function parsePensionMons(pension) {
+    refreshDomPensionInfo(pension);
 
-    var counterPaths = [
-      ['eggSeq'],
-      ['nextEggK'],
-      ['eggK'],
-      ['eggCounter'],
-      ['eggCount'],
-      ['eggIndex'],
-      ['daycare', 'eggSeq'],
-      ['daycare', 'nextEggK'],
-      ['daycare', 'eggK'],
-      ['daycare', 'k'],
-      ['daycare', 'seq'],
-      ['daycare', 'count'],
-      ['breeding', 'eggSeq'],
-      ['breeding', 'k'],
-      ['breeding', 'seq'],
-      ['nursery', 'eggSeq'],
-      ['nursery', 'k'],
-      ['trainer', 'eggSeq'],
-      ['trainer', 'eggK'],
-      ['trainer', 'eggCounter'],
-      ['stats', 'eggsLaid'],
-      ['stats', 'totalEggs'],
-      ['stats', 'eggs']
-    ];
-
-    for (var c = 0; c < counterPaths.length; c++) {
-      var val = getByPath(save, counterPaths[c]);
-      if (typeof val === 'number' && Number.isInteger(val) && val >= 0) {
-        var pathStr = 'save.' + counterPaths[c].join('.');
-        if (maxEggK !== null && val <= maxEggK) {
-          return {
-            nextK: maxEggK + 1,
-            source: 'max(egg.k)+1（' + pathStr + '=' + val + '）'
-          };
-        }
-        return {
-          nextK: val,
-          source: pathStr + ' = ' + val
-        };
-      }
-    }
-
-    if (maxEggK !== null) {
-      return {
-        nextK: maxEggK + 1,
-        source: '推算 max(egg.k)+1'
-      };
-    }
-
-    return {
-      nextK: 0,
-      source: '預設 0（尚無蛋計數）'
-    };
-  }
-
-  function buildMonLookup(save) {
-    var map = Object.create(null);
-    var poolKeys = ['box', 'party', 'pokemon', 'mons', 'roster', 'storage', 'collection', 'team', 'inventory'];
-    for (var i = 0; i < poolKeys.length; i++) {
-      var arr = save[poolKeys[i]];
-      if (!Array.isArray(arr)) continue;
-      for (var j = 0; j < arr.length; j++) {
-        var m = arr[j];
-        if (!m || typeof m !== 'object') continue;
-        if (m.uid != null) map[String(m.uid)] = m;
-        if (m.id != null && typeof m.id === 'string') map[m.id] = m;
-      }
-    }
-    return map;
-  }
-
-  function extractMonInfo(rawMon, monLookup) {
-    if (rawMon == null) return null;
-    var m = rawMon;
-    if (typeof rawMon === 'string' || typeof rawMon === 'number') {
-      m = monLookup[String(rawMon)] || null;
-      if (!m) {
-        return {
-          speciesId: typeof rawMon === 'number' ? rawMon : null,
-          name: '#' + rawMon,
-          shiny: false
-        };
-      }
-    }
-    if (!m || typeof m !== 'object') return null;
-    var sid =
-      m.speciesId != null ? +m.speciesId :
-      m.pokemonId != null ? +m.pokemonId :
-      m.dexId != null ? +m.dexId :
-      m.monId != null ? +m.monId :
-      typeof m.species === 'number' ? m.species :
-      typeof m.id === 'number' ? m.id : null;
-    var isShiny = !!(m.shiny || m.isShiny);
-    var name = m.nickname || m.name || m.speciesName || (sid != null ? '#' + sid : '未知');
-    return {
-      speciesId: Number.isFinite(sid) ? sid : null,
-      name: String(name),
-      shiny: isShiny
-    };
-  }
-
-  function detectDaycare(save) {
-    var dc = save.daycare || save.breeding || save.nursery || save.pension || null;
-    if (!dc || typeof dc !== 'object') return null;
-
-    var rawParents = [];
-    if (Array.isArray(dc)) {
-      rawParents = dc.slice(0, 2);
-    } else if (Array.isArray(dc.slots)) {
-      rawParents = dc.slots;
-    } else if (Array.isArray(dc.parents)) {
-      rawParents = dc.parents;
-    } else if (Array.isArray(dc.pair)) {
-      rawParents = dc.pair;
-    } else if (Array.isArray(dc.mons)) {
-      rawParents = dc.mons;
-    } else if (Array.isArray(dc.pokemon)) {
-      rawParents = dc.pokemon;
-    } else if (dc.p1 !== undefined || dc.p2 !== undefined) {
-      rawParents = [dc.p1, dc.p2];
-    } else if (dc.a !== undefined || dc.b !== undefined) {
-      rawParents = [dc.a, dc.b];
-    } else if (dc.slot1 !== undefined || dc.slot2 !== undefined) {
-      rawParents = [dc.slot1, dc.slot2];
-    }
-
-    var lookup = buildMonLookup(save);
-    var parents = [];
-    for (var i = 0; i < rawParents.length; i++) {
-      var info = extractMonInfo(rawParents[i], lookup);
-      if (info) parents.push(info);
-    }
-
+    var rawMons = (pension && Array.isArray(pension.mons)) ? pension.mons : [];
+    var dittos = [];
+    var parentPool = []; // 可生蛋非百變怪親代（1號位、2號位、3號位...）
+    var blockedMons = []; // noEgg 或 NO_EGG_IDS
+    var allParsed = [];
     var warnings = [];
-    var hasShinyParent = false;
-    var dittoCount = 0;
+    var firstMonKeys = [];
+    var firstEntryKeys = [];
 
-    for (var j = 0; j < parents.length; j++) {
-      var p = parents[j];
-      if (p.shiny) hasShinyParent = true;
-      if (p.speciesId === DITTO_ID) dittoCount++;
-      if (p.speciesId != null && NO_EGG_IDS.indexOf(p.speciesId) !== -1) {
-        warnings.push('#' + p.speciesId + ' 屬於不可生蛋品種（NO_EGG_IDS）');
+    for (var i = 0; i < rawMons.length; i++) {
+      var entry = rawMons[i];
+      if (!entry || typeof entry !== 'object') continue;
+      var m = (entry.mon && typeof entry.mon === 'object') ? entry.mon : entry;
+      if (!m || typeof m !== 'object') continue;
+
+      if (firstMonKeys.length === 0) {
+        firstEntryKeys = Object.keys(entry);
+        firstMonKeys = Object.keys(m);
+      }
+
+      var id =
+        m.id != null ? +m.id :
+        m.speciesId != null ? +m.speciesId :
+        m.pokemonId != null ? +m.pokemonId :
+        m.dexId != null ? +m.dexId : null;
+      if (!Number.isFinite(id)) continue;
+
+      var uid = m.uid != null ? String(m.uid) : null;
+      var cached = uid ? domPensionCache.get(uid) : null;
+      var shiny = !!(m.shiny || m.isShiny);
+
+      var rawLv =
+        m.lv != null ? +m.lv :
+        m.level != null ? +m.level :
+        m.lvl != null ? +m.lvl :
+        entry.lv != null ? +entry.lv :
+        entry.level != null ? +entry.level : null;
+      var lv = (rawLv != null && Number.isFinite(rawLv) && rawLv > 0)
+        ? rawLv
+        : (cached && cached.lv != null ? cached.lv : null);
+
+      var expWidth = (cached && cached.expWidth) ? cached.expWidth : '';
+      var expLabel = (cached && cached.expLabel) ? cached.expLabel : '';
+
+      var noEgg = !!(m.noEgg || NO_EGG_IDS.indexOf(id) !== -1);
+      var rawDomName = (cached && cached.name) || m.name || m.nickname || idToName[id] || '';
+      var domName = cleanMonName(String(rawDomName));
+      if (isValidLearnedName(domName)) {
+        recordIdName(id, domName);
+      } else if (idToName[id]) {
+        domName = idToName[id];
+      }
+
+      var hasDomImg = !!(cached && cached.imgSrc);
+      var imgSrc = hasDomImg ? cached.imgSrc : getFallbackMonImg(id, shiny);
+      var isStaticFallback = !hasDomImg || imgSrc.indexOf('data:') !== 0;
+      var candy = entry.candy != null ? entry.candy : null;
+
+      var info = {
+        id: id,
+        uid: uid,
+        shiny: shiny,
+        lv: lv,
+        expWidth: expWidth,
+        expLabel: expLabel,
+        noEgg: noEgg,
+        domName: domName || null,
+        imgSrc: imgSrc,
+        isStaticFallback: isStaticFallback,
+        candy: candy,
+        isDitto: id === DITTO_ID,
+        slotNum: null
+      };
+
+      allParsed.push(info);
+
+      if (id === DITTO_ID) {
+        dittos.push(info);
+      } else if (noEgg) {
+        blockedMons.push(info);
+        warnings.push((domName || '寶可夢') + ' 為不可生蛋品種');
+      } else {
+        info.slotNum = parentPool.length + 1;
+        parentPool.push(info);
       }
     }
 
-    if (dittoCount >= 2) {
-      warnings.push('雙百變怪（#132）無法生蛋');
+    flushIdToNameStorage();
+
+    if (dittos.length >= 2 && parentPool.length === 0) {
+      warnings.push('僅放置百變怪無法生蛋');
     }
 
-    var berryActive = !!(
-      (!Array.isArray(dc) && (dc.bx || dc.shinyBerry || dc.berryActive || (dc.berry && dc.berry > 0))) ||
-      save.shinyBerryActive
-    );
+    var shinyParentCount = 0;
+    for (var p = 0; p < parentPool.length; p++) {
+      if (parentPool[p].shiny) shinyParentCount++;
+    }
+    var hasShinyDitto = false;
+    for (var d = 0; d < dittos.length; d++) {
+      if (dittos[d].shiny) hasShinyDitto = true;
+    }
 
-    if (parents.length === 0 && !berryActive) return null;
+    var summaryParts = [];
+    if (dittos.length > 0) {
+      summaryParts.push(
+        '百變怪' +
+        (dittos.length > 1 ? '×' + dittos.length : '') +
+        (hasShinyDitto ? '(✦閃光)' : '')
+      );
+    }
+    if (parentPool.length > 0) {
+      summaryParts.push(
+        parentPool.length + '隻親代' +
+        (shinyParentCount > 0 ? '（含' + shinyParentCount + '隻閃光）' : '（無閃光）')
+      );
+    }
+    if (summaryParts.length === 0 && blockedMons.length > 0) {
+      summaryParts.push('不可生蛋×' + blockedMons.length);
+    }
+    var summaryText = summaryParts.length > 0 ? summaryParts.join(' + ') : '目前未放置親代';
 
     return {
-      parents: parents,
-      hasShinyParent: hasShinyParent,
-      berryActive: berryActive,
-      warnings: warnings
+      allMons: allParsed,
+      dittos: dittos,
+      parentPool: parentPool,
+      blockedMons: blockedMons,
+      shinyParentCount: shinyParentCount,
+      hasShinyDitto: hasShinyDitto,
+      summaryText: summaryText,
+      warnings: warnings,
+      firstEntryKeys: firstEntryKeys,
+      firstMonKeys: firstMonKeys
     };
   }
 
   function extractGameState(save) {
     var seed = trainerSeed(save);
-    var hasTrainer = !!(save && save.trainer && (save.trainer.since != null || save.trainer.id != null));
-    var eggDetect = detectEggs(save);
+    var pension = (save && save.pension && typeof save.pension === 'object') ? save.pension : null;
+
+    // 先解析培育屋親代與 DOM 名稱快取，讓持有蛋也能直接命中 idToName
+    var pensionInfo = parsePensionMons(pension);
+
+    var rawEggs = [];
+    var eggsPath = 'save.pension.eggs';
+    if (pension && Array.isArray(pension.eggs)) {
+      rawEggs = pension.eggs;
+    } else if (Array.isArray(save.eggs)) {
+      rawEggs = save.eggs;
+      eggsPath = 'save.eggs';
+    }
+
     var evaluatedEggs = [];
     var shinyEggs = [];
-
-    for (var i = 0; i < eggDetect.eggs.length; i++) {
-      var ev = evaluateEgg(eggDetect.eggs[i], i, save);
+    for (var i = 0; i < rawEggs.length; i++) {
+      var ev = evaluateEgg(rawEggs[i], i, save);
       evaluatedEggs.push(ev);
       if (ev.isShiny) shinyEggs.push(ev);
     }
 
-    var kDetect = detectNextK(save, evaluatedEggs);
-    var daycare = detectDaycare(save);
+    var laid = 0;
+    var kSource = '';
+    if (pension && typeof pension.laid === 'number' && Number.isInteger(pension.laid) && pension.laid >= 0) {
+      laid = pension.laid;
+      kSource = 'save.pension.laid = ' + laid;
+    } else {
+      var hatched = (save && save.stats && typeof save.stats.hatched === 'number') ? save.stats.hatched : 0;
+      var eggsLen = (pension && Array.isArray(pension.eggs)) ? pension.eggs.length : rawEggs.length;
+      laid = hatched + eggsLen;
+      kSource = '(stats.hatched=' + hatched + ') + (pension.eggs.length=' + eggsLen + ') = ' + laid;
+    }
+
+    var berryActive = !!(pension && pension.bx);
+
+    var pensionDebugSummary = null;
+    if (pension) {
+      pensionDebugSummary = {
+        keys: Object.keys(pension),
+        laid: pension.laid,
+        bx: pension.bx,
+        eggsCount: Array.isArray(pension.eggs) ? pension.eggs.length : 0,
+        monsCount: Array.isArray(pension.mons) ? pension.mons.length : 0,
+        firstEntryKeys: pensionInfo.firstEntryKeys,
+        firstMonKeys: pensionInfo.firstMonKeys,
+        mons: pensionInfo.allMons.map(function (m) {
+          return {
+            slot: m.isDitto ? '百變怪' : (m.slotNum ? m.slotNum + '號位' : '不可生蛋'),
+            id: m.id,
+            uid: m.uid,
+            shiny: m.shiny,
+            lv: m.lv,
+            exp: m.expLabel || undefined,
+            noEgg: m.noEgg,
+            name: m.domName || undefined
+          };
+        })
+      };
+    }
 
     return {
       save: save,
       seed: seed,
-      hasTrainer: hasTrainer,
-      eggsPath: eggDetect.path,
+      laid: laid,
+      kSource: kSource,
+      berryActive: berryActive,
+      eggsPath: eggsPath,
       eggs: evaluatedEggs,
       shinyEggs: shinyEggs,
-      autoNextK: kDetect.nextK,
-      kSource: kDetect.source,
-      daycare: daycare,
-      topKeys: Object.keys(save).slice(0, 24)
+      pensionInfo: pensionInfo,
+      pensionDebugSummary: pensionDebugSummary,
+      topKeys: Object.keys(save)
     };
   }
 
   // ============================================================================
-  // 色違序列預測引擎
+  // 資料簽名（只要簽名未變，定時輪詢絕不重繪 DOM，徹底防止滾動條跳回頂部）
+  // ============================================================================
+  function computeRenderSignature(state) {
+    var uiSig = [
+      uiState.collapsed ? 1 : 0,
+      uiState.activeTab,
+      uiState.filterTier,
+      uiState.visibleCount,
+      uiState.showDebug ? 1 : 0,
+      uiState.activeTab === 'eggs' ? lastDomMatchInfo.matched : 0
+    ].join(':');
+
+    if (!state) return 'empty|' + uiSig;
+
+    var monsSig = state.pensionInfo.allMons
+      .map(function (m) {
+        return [
+          m.id,
+          m.uid || '',
+          m.shiny ? 1 : 0,
+          m.lv != null ? m.lv : '',
+          m.expWidth || '',
+          m.noEgg ? 1 : 0,
+          m.domName || '',
+          m.isStaticFallback ? 'static' : 'dom'
+        ].join(':');
+      })
+      .join(';');
+
+    var eggsSig = state.eggs
+      .map(function (e) {
+        return [
+          e.uid || '',
+          e.k != null ? e.k : '',
+          e.speciesId != null ? e.speciesId : '',
+          e.displayName || '',
+          e.sp,
+          e.bx ? 1 : 0,
+          e.isShiny ? 1 : 0
+        ].join(':');
+      })
+      .join(';');
+
+    return [
+      state.seed,
+      state.laid,
+      state.berryActive ? 1 : 0,
+      monsSig,
+      eggsSig,
+      uiSig
+    ].join('|');
+  }
+
+  // ============================================================================
+  // 生蛋序列預測引擎（上方 4 張摘要卡往後找第一筆色違 + 下方列出 1000 顆全部蛋序）
   // ============================================================================
   function classifyMinTier(roll) {
-    if (roll < TIERS[0].th) return TIERS[0]; // base 1/512
-    if (roll < TIERS[1].th) return TIERS[1]; // berry 1/256
-    if (roll < TIERS[2].th) return TIERS[2]; // parent 1/16
-    if (roll < TIERS[3].th) return TIERS[3]; // parentBerry 1/8
+    if (roll < TIERS[0].th) return TIERS[0]; // 普通親代: roll < 1/512
+    if (roll < TIERS[1].th) return TIERS[1]; // 吃果普通親代: 1/512 <= roll < 1/256
+    if (roll < TIERS[2].th) return TIERS[2]; // 閃光親代: 1/256 <= roll < 1/16
+    if (roll < TIERS[3].th) return TIERS[3]; // 吃果閃光親代: 1/16 <= roll < 1/8
     return null;
   }
 
-  function predictSequence(save, startK, scanLimit, filterTier) {
+  function resolveParentForK(k, parentPool) {
+    if (!parentPool || parentPool.length === 0) return null;
+    var idx = ((k % parentPool.length) + parentPool.length) % parentPool.length;
+    return parentPool[idx];
+  }
+
+  function predictSequence(state, filterTier) {
+    var save = state.save;
+    var laid = state.laid;
+    var parentPool = state.pensionInfo ? state.pensionInfo.parentPool : [];
     var maxTh = TIERS[3].th; // 1/8 = 0.125
-    var filterTh = maxTh;
-    for (var t = 0; t < TIERS.length; t++) {
-      if (TIERS[t].id === filterTier) {
-        filterTh = TIERS[t].th;
-        break;
-      }
-    }
 
+    // 上方 4 張摘要卡：各自往後找對應互斥區間的第一筆色違（最多掃描 8000 顆避免空白）
     var nearest = {
-      base: null,
-      berry: null,
-      parent: null,
-      parentBerry: null
+      base: null,        // roll < 1/512
+      berry: null,       // 1/512 <= roll < 1/256
+      parent: null,      // 1/256 <= roll < 1/16
+      parentBerry: null  // 1/16 <= roll < 1/8
     };
-    var hits = [];
-    var MAX_TABLE_ROWS = 100;
-    var EXTENDED_MAX = Math.max(scanLimit, 8000);
 
-    for (var offset = 0; offset < EXTENDED_MAX; offset++) {
-      var k = startK + offset;
+    var rows = [];
+    var earliestShiny = null;
+
+    for (var step = 0; step < CARD_SEARCH_MAX; step++) {
+      var k = laid + step;
       var roll = eggKHash(k, save);
+      var minTier = roll < maxTh ? classifyMinTier(roll) : null;
+      var slotParent = resolveParentForK(k, parentPool);
+      var slotNum = slotParent ? slotParent.slotNum : null;
+      var slotName = slotParent ? (slotParent.domName || null) : null;
 
-      if (roll < maxTh) {
-        var minTier = classifyMinTier(roll);
-        if (!nearest.parentBerry) nearest.parentBerry = { k: k, offset: offset, roll: roll };
-        if (!nearest.parent && roll < TIERS[2].th) nearest.parent = { k: k, offset: offset, roll: roll };
-        if (!nearest.berry && roll < TIERS[1].th) nearest.berry = { k: k, offset: offset, roll: roll };
-        if (!nearest.base && roll < TIERS[0].th) nearest.base = { k: k, offset: offset, roll: roll };
+      if (minTier) {
+        var hitObj = {
+          k: k,
+          step: step,
+          roll: roll,
+          minTier: minTier,
+          slotNum: slotNum,
+          slotName: slotName
+        };
 
-        if (offset < scanLimit && hits.length < MAX_TABLE_ROWS && roll < filterTh) {
-          hits.push({
+        if (!earliestShiny) earliestShiny = hitObj;
+        if (minTier.id === 'base' && !nearest.base) {
+          nearest.base = hitObj;
+        } else if (minTier.id === 'berry' && !nearest.berry) {
+          nearest.berry = hitObj;
+        } else if (minTier.id === 'parent' && !nearest.parent) {
+          nearest.parent = hitObj;
+        } else if (minTier.id === 'parentBerry' && !nearest.parentBerry) {
+          nearest.parentBerry = hitObj;
+        }
+      }
+
+      // 下方生蛋預測列表：列出 step = 0 .. 999（1000 顆內）的每一顆蛋
+      if (step < LIST_TOTAL_EGGS) {
+        if (filterTier === 'all' || (minTier && minTier.id === filterTier)) {
+          rows.push({
             k: k,
-            offset: offset,
-            nth: offset + 1,
+            step: step,
             roll: roll,
-            minTier: minTier
+            minTier: minTier, // null 代表一般（非色違）蛋
+            slotNum: slotNum,
+            slotName: slotName
           });
         }
       }
 
-      // 若已達使用者掃描上限且 4 個層級都找到最近命中，提早結束
       if (
-        offset + 1 >= scanLimit &&
+        step + 1 >= LIST_TOTAL_EGGS &&
         nearest.base &&
         nearest.berry &&
         nearest.parent &&
@@ -574,11 +815,15 @@
       }
     }
 
+    var visibleLimit = Math.min(rows.length, uiState.visibleCount);
+
     return {
-      startK: startK,
-      scanLimit: scanLimit,
+      laid: laid,
       nearest: nearest,
-      hits: hits
+      earliestShiny: earliestShiny,
+      totalRows: rows.length,
+      rows: rows.slice(0, visibleLimit),
+      hasMore: visibleLimit < rows.length
     };
   }
 
@@ -641,16 +886,6 @@
     return true;
   }
 
-  function hasEggCue(el) {
-    if (!el) return false;
-    var cls = typeof el.className === 'string' ? el.className : '';
-    if (/egg/i.test(cls)) return true;
-    var txt = el.textContent || '';
-    if (txt.indexOf('🥚') !== -1) return true;
-    if (el.querySelector && el.querySelector('img[src*="egg" i], img[alt*="egg" i], img[alt*="蛋"]')) return true;
-    return false;
-  }
-
   function findBestCardAncestor(el) {
     var cur = el;
     var best = null;
@@ -659,7 +894,6 @@
         var rect = cur.getBoundingClientRect();
         if (rect.width >= 48 && rect.height >= 40 && rect.width <= 520 && rect.height <= 360) {
           best = cur;
-          // 若同層有多個同標籤兄弟元素，這通常就是蛋卡片本體
           var parent = cur.parentElement;
           if (parent && parent.children.length >= 2) {
             var sameTagSiblings = 0;
@@ -695,7 +929,7 @@
 
     var eggs = state.eggs;
     var shinyEggs = state.shinyEggs;
-    var matchedMap = new Map(); // Element -> label string
+    var matchedMap = new Map();
 
     var shinyUidMap = Object.create(null);
     var shinyKMap = Object.create(null);
@@ -705,7 +939,6 @@
       if (se.k != null) shinyKMap[String(se.k)] = se;
     }
 
-    // 策略 A：精準 data-* 屬性比對（uid / k）
     var attrEls = document.querySelectorAll('[data-egg-uid], [data-uid], [data-egg-id], [data-egg-k], [data-k]');
     for (var a = 0; a < attrEls.length; a++) {
       var el = attrEls[a];
@@ -713,12 +946,11 @@
       var uidVal = el.getAttribute('data-egg-uid') || el.getAttribute('data-uid') || el.getAttribute('data-egg-id');
       var kVal = el.getAttribute('data-egg-k') || el.getAttribute('data-k');
       var hit = (uidVal && shinyUidMap[uidVal]) || (kVal && shinyKMap[kVal]) || null;
-      if (hit && (hasEggCue(el) || el.hasAttribute('data-egg-uid') || el.hasAttribute('data-egg-k'))) {
+      if (hit) {
         matchedMap.set(el, '✨ 色違蛋' + (hit.k != null ? ' k=' + hit.k : ''));
       }
     }
 
-    // 策略 B：同父容器蛋卡片順序對應（完全符合 eggs.length）
     if (matchedMap.size < shinyEggs.length && eggs.length > 0) {
       var eggMarkers = [];
       var candidateNodes = document.querySelectorAll(
@@ -728,7 +960,6 @@
         if (!isInsideOurHost(candidateNodes[c])) eggMarkers.push(candidateNodes[c]);
       }
 
-      // 也掃描含 🥚 emoji 的可見短元素
       if (document.body) {
         var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
         var node;
@@ -742,7 +973,7 @@
         }
       }
 
-      var parentGroups = new Map(); // parentElement -> Set<cardElement>
+      var parentGroups = new Map();
       for (var m = 0; m < eggMarkers.length; m++) {
         var card = findBestCardAncestor(eggMarkers[m]);
         if (!card || !card.parentElement) continue;
@@ -752,7 +983,6 @@
       }
 
       parentGroups.forEach(function (cardSet, parentEl) {
-        // 按 DOM 順序排列
         var ordered = [];
         for (var idx = 0; idx < parentEl.children.length; idx++) {
           var ch = parentEl.children[idx];
@@ -768,7 +998,6 @@
         }
       });
 
-      // 策略 C：若所有持有蛋都是色違且尚未標記，標記唯一合理蛋卡片組
       if (matchedMap.size === 0 && shinyEggs.length === eggs.length) {
         parentGroups.forEach(function (cardSet) {
           if (cardSet.size > 0 && cardSet.size <= eggs.length) {
@@ -780,7 +1009,6 @@
       }
     }
 
-    // 清除過期標記
     var existing = document.querySelectorAll('.' + GOLD_CLASS);
     for (var x = 0; x < existing.length; x++) {
       if (!matchedMap.has(existing[x])) {
@@ -790,7 +1018,6 @@
       }
     }
 
-    // 套用新標記
     matchedMap.forEach(function (label, targetEl) {
       if (!targetEl.classList.contains(GOLD_CLASS)) {
         if (window.getComputedStyle(targetEl).position === 'static') {
@@ -811,20 +1038,29 @@
   }
 
   // ============================================================================
-  // chrome.storage.local 偏好存取（僅儲存面板收合/位置/篩選設定）
+  // chrome.storage.local 偏好與本地 idToName 快取存取
   // ============================================================================
   function loadUiPrefs(cb) {
     try {
       if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-        chrome.storage.local.get([STORAGE_KEY], function (res) {
+        chrome.storage.local.get([STORAGE_KEY, ID_NAME_STORAGE_KEY], function (res) {
           var saved = res && res[STORAGE_KEY];
           if (saved && typeof saved === 'object') {
             if (typeof saved.collapsed === 'boolean') uiState.collapsed = saved.collapsed;
             if (saved.activeTab === 'predict' || saved.activeTab === 'eggs') uiState.activeTab = saved.activeTab;
             if (typeof saved.filterTier === 'string') uiState.filterTier = saved.filterTier;
-            if (typeof saved.scanLimit === 'number') uiState.scanLimit = saved.scanLimit;
             if (saved.pos && typeof saved.pos.right === 'number' && typeof saved.pos.bottom === 'number') {
               uiState.pos = saved.pos;
+            }
+          }
+          var savedNames = res && res[ID_NAME_STORAGE_KEY];
+          if (savedNames && typeof savedNames === 'object') {
+            var keys = Object.keys(savedNames);
+            for (var i = 0; i < keys.length; i++) {
+              var k = keys[i];
+              if (isValidLearnedName(savedNames[k])) {
+                idToName[k] = savedNames[k];
+              }
             }
           }
           cb();
@@ -845,7 +1081,6 @@
           collapsed: uiState.collapsed,
           activeTab: uiState.activeTab,
           filterTier: uiState.filterTier,
-          scanLimit: uiState.scanLimit,
           pos: uiState.pos
         };
         chrome.storage.local.set(payload);
@@ -856,7 +1091,7 @@
   }
 
   // ============================================================================
-  // Shadow DOM 浮動介面（零依賴純原生 CSS + HTML）
+  // Shadow DOM 浮動介面
   // ============================================================================
   function escapeHtml(str) {
     return String(str)
@@ -866,15 +1101,10 @@
       .replace(/"/g, '&quot;');
   }
 
-  function formatRoll(roll) {
-    if (roll == null || !Number.isFinite(roll)) return '—';
-    return roll.toFixed(6);
-  }
-
-  function formatDist(hit) {
-    if (!hit) return '>8000';
-    if (hit.offset === 0) return '下一顆！';
-    return '第 ' + (hit.offset + 1) + ' 顆';
+  function formatCardMainDist(hit) {
+    if (!hit) return '> ' + CARD_SEARCH_MAX + ' 顆';
+    if (hit.step === 0) return '下一顆是！';
+    return '再過 ' + hit.step + ' 顆';
   }
 
   function getShadowStyles() {
@@ -911,7 +1141,7 @@
       '  box-shadow: 0 0 0 2px rgba(255, 215, 0, 0.3), 0 8px 24px rgba(245, 183, 0, 0.35);',
       '}',
       '.pill-badge {',
-      '  padding: 2px 6px;',
+      '  padding: 2px 7px;',
       '  border-radius: 999px;',
       '  font-size: 11px;',
       '  font-weight: 700;',
@@ -920,93 +1150,188 @@
       '}',
       '.pill-badge.gold {',
       '  background: linear-gradient(135deg, #fff2a1, #f5b700);',
-      '  color: #1f1400;',
+      '  color: #2b1700;',
       '}',
       '.panel {',
-      '  width: 348px;',
+      '  width: 372px;',
       '  max-width: calc(100vw - 24px);',
       '  max-height: calc(100vh - 32px);',
       '  display: flex;',
       '  flex-direction: column;',
-      '  background: rgba(13, 18, 30, 0.95);',
+      '  background: rgba(13, 18, 30, 0.96);',
       '  backdrop-filter: blur(10px);',
       '  border: 1px solid rgba(148, 163, 184, 0.28);',
       '  border-radius: 14px;',
-      '  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);',
+      '  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.58);',
       '  overflow: hidden;',
       '}',
-      '.panel.has-shiny { border-color: rgba(255, 215, 0, 0.72); }',
+      '.panel.has-shiny { border-color: rgba(255, 215, 0, 0.75); }',
       '.header {',
       '  display: flex;',
       '  align-items: center;',
       '  justify-content: space-between;',
-      '  padding: 9px 11px;',
-      '  background: linear-gradient(180deg, rgba(30, 41, 59, 0.9), rgba(15, 23, 42, 0.9));',
+      '  padding: 9px 12px;',
+      '  background: linear-gradient(180deg, rgba(30, 41, 59, 0.92), rgba(15, 23, 42, 0.92));',
       '  border-bottom: 1px solid rgba(148, 163, 184, 0.18);',
       '  cursor: grab;',
       '}',
       '.header:active { cursor: grabbing; }',
       '.title { display: flex; align-items: center; gap: 6px; font-weight: 700; font-size: 13px; color: #f8fafc; }',
-      '.header-actions { display: flex; align-items: center; gap: 4px; }',
+      '.header-actions { display: flex; align-items: center; gap: 5px; }',
       '.icon-btn {',
       '  border: 1px solid rgba(148, 163, 184, 0.25);',
       '  background: rgba(30, 41, 59, 0.7);',
       '  color: #cbd5e1;',
       '  border-radius: 6px;',
-      '  padding: 3px 7px;',
+      '  padding: 3px 8px;',
       '  font-size: 11px;',
       '  cursor: pointer;',
       '}',
-      '.icon-btn:hover { background: rgba(51, 65, 85, 0.9); color: #fff; border-color: rgba(255, 215, 0, 0.5); }',
-      '.body { padding: 10px; overflow-y: auto; display: flex; flex-direction: column; gap: 9px; }',
-      '.meta-bar {',
+      '.icon-btn:hover { background: rgba(51, 65, 85, 0.9); color: #fff; border-color: rgba(255, 215, 0, 0.55); }',
+      '.body { padding: 10px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }',
+      '.status-bar {',
       '  display: flex;',
-      '  flex-wrap: wrap;',
       '  align-items: center;',
       '  justify-content: space-between;',
-      '  gap: 6px;',
-      '  padding: 6px 8px;',
-      '  border-radius: 8px;',
-      '  background: rgba(30, 41, 59, 0.55);',
-      '  border: 1px solid rgba(148, 163, 184, 0.15);',
+      '  gap: 8px;',
+      '  padding: 7px 10px;',
+      '  border-radius: 9px;',
+      '  background: rgba(30, 41, 59, 0.62);',
+      '  border: 1px solid rgba(255, 215, 0, 0.24);',
       '  font-variant-numeric: tabular-nums;',
       '}',
-      '.seed-text { font-size: 11px; color: #94a3b8; overflow: hidden; text-overflow: ellipsis; max-width: 140px; white-space: nowrap; }',
-      '.k-ctrl { display: inline-flex; align-items: center; gap: 3px; }',
-      '.k-input {',
-      '  width: 56px;',
-      '  padding: 2px 5px;',
-      '  border-radius: 5px;',
-      '  border: 1px solid rgba(148, 163, 184, 0.35);',
-      '  background: rgba(15, 23, 42, 0.9);',
-      '  color: #fde047;',
+      '.status-k { font-size: 12px; font-weight: 700; color: #f1f5f9; }',
+      '.status-k strong { color: #ffd700; font-size: 13px; }',
+      '.status-bx {',
       '  font-size: 11px;',
       '  font-weight: 700;',
-      '  text-align: center;',
-      '  font-variant-numeric: tabular-nums;',
+      '  padding: 2px 8px;',
+      '  border-radius: 999px;',
+      '  border: 1px solid rgba(148, 163, 184, 0.3);',
+      '  background: rgba(15, 23, 42, 0.75);',
+      '  color: #94a3b8;',
       '}',
-      '.mini-btn {',
-      '  border: 1px solid rgba(148, 163, 184, 0.28);',
-      '  background: rgba(30, 41, 59, 0.85);',
-      '  color: #e2e8f0;',
-      '  border-radius: 5px;',
-      '  padding: 2px 6px;',
-      '  font-size: 11px;',
-      '  cursor: pointer;',
+      '.status-bx.eaten {',
+      '  border-color: #f5b700;',
+      '  background: rgba(245, 183, 0, 0.18);',
+      '  color: #fde047;',
       '}',
-      '.mini-btn:hover { border-color: #ffd700; color: #fff; }',
-      '.mini-btn.active { background: rgba(245, 183, 0, 0.22); border-color: #ffd700; color: #fde047; }',
-      '.daycare-box {',
-      '  padding: 6px 8px;',
-      '  border-radius: 8px;',
-      '  background: rgba(30, 41, 59, 0.45);',
+      '.pension-box {',
+      '  padding: 8px 10px;',
+      '  border-radius: 9px;',
+      '  background: rgba(30, 41, 59, 0.48);',
       '  border: 1px solid rgba(148, 163, 184, 0.18);',
-      '  font-size: 11px;',
       '  display: flex;',
       '  flex-direction: column;',
-      '  gap: 4px;',
+      '  gap: 6px;',
       '}',
-      '.daycare-warn { color: #fca5a5; font-weight: 700; }',
+      '.pension-summary { font-size: 11px; font-weight: 700; color: #e2e8f0; }',
+      /* 培育屋固定垂直列排版：三段式佈局 + 最大化 48x48 寶可夢圖片（上移垂直置中） */
+      '.pension-list { display: flex; flex-direction: column; gap: 6px; }',
+      '.mon-row {',
+      '  display: flex;',
+      '  align-items: center;',
+      '  justify-content: space-between;',
+      '  gap: 8px;',
+      '  width: 100%;',
+      '  min-height: 52px;',
+      '  padding: 4px 10px;',
+      '  border-radius: 8px;',
+      '  background: rgba(15, 23, 42, 0.85);',
+      '  border: 1px solid rgba(148, 163, 184, 0.24);',
+      '  font-size: 12px;',
+      '  color: #e2e8f0;',
+      '  font-variant-numeric: tabular-nums;',
+      '}',
+      '.mon-row.shiny {',
+      '  border-color: rgba(255, 215, 0, 0.65);',
+      '  background: linear-gradient(90deg, rgba(45, 32, 8, 0.82) 0%, rgba(15, 23, 42, 0.88) 100%);',
+      '}',
+      '.mon-left {',
+      '  display: inline-flex;',
+      '  align-items: center;',
+      '  gap: 6px;',
+      '  min-width: 0;',
+      '  flex: 1 1 auto;',
+      '  overflow: hidden;',
+      '}',
+      '.mon-slot {',
+      '  font-weight: 800;',
+      '  color: #f8fafc;',
+      '  white-space: nowrap;',
+      '  flex-shrink: 0;',
+      '}',
+      '.mon-row.shiny .mon-slot { color: #ffd700; }',
+      '.mon-name {',
+      '  font-weight: 700;',
+      '  color: #f1f5f9;',
+      '  white-space: nowrap;',
+      '  overflow: hidden;',
+      '  text-overflow: ellipsis;',
+      '}',
+      '.shiny-mark {',
+      '  color: #ffd700;',
+      '  font-weight: 800;',
+      '  font-size: 10.5px;',
+      '  white-space: nowrap;',
+      '  flex-shrink: 0;',
+      '  text-shadow: 0 0 6px rgba(255, 215, 0, 0.55);',
+      '}',
+      '.mon-mid {',
+      '  display: flex;',
+      '  flex-direction: column;',
+      '  justify-content: center;',
+      '  gap: 3px;',
+      '  width: 92px;',
+      '  min-width: 54px;',
+      '  flex: 0 1 92px;',
+      '}',
+      '.mon-lv-row {',
+      '  display: flex;',
+      '  align-items: baseline;',
+      '  justify-content: space-between;',
+      '  gap: 4px;',
+      '  font-size: 10.5px;',
+      '  line-height: 1.1;',
+      '}',
+      '.mon-lv { font-weight: 700; color: #cbd5e1; }',
+      '.mon-exp-pct { font-size: 9.5px; color: #94a3b8; }',
+      '.mon-gauge {',
+      '  width: 100%;',
+      '  height: 5px;',
+      '  border-radius: 999px;',
+      '  background: rgba(2, 6, 23, 0.85);',
+      '  border: 1px solid rgba(148, 163, 184, 0.22);',
+      '  overflow: hidden;',
+      '}',
+      '.mon-gauge-fill {',
+      '  display: block;',
+      '  height: 100%;',
+      '  border-radius: 999px;',
+      '  background: linear-gradient(90deg, #38bdf8 0%, #f5b700 100%);',
+      '}',
+      '.mon-avatar-box {',
+      '  width: 48px;',
+      '  height: 48px;',
+      '  flex-shrink: 0;',
+      '  overflow: hidden;',
+      '  display: flex;',
+      '  align-items: center;',
+      '  justify-content: center;',
+      '}',
+      '.mon-avatar {',
+      '  width: 100%;',
+      '  height: 100%;',
+      '  object-fit: contain;',
+      '  image-rendering: pixelated;',
+      '  transform: translateY(-5px);',
+      '  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.5));',
+      '}',
+      '.mon-avatar.fallback-scale {',
+      '  transform: translateY(-5px) scale(1.65);',
+      '  transform-origin: center center;',
+      '}',
+      '.pension-warn { color: #fca5a5; font-size: 11px; font-weight: 700; }',
       '.tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }',
       '.tab-btn {',
       '  padding: 6px 8px;',
@@ -1020,108 +1345,222 @@
       '}',
       '.tab-btn.active {',
       '  background: rgba(245, 183, 0, 0.18);',
-      '  border-color: rgba(255, 215, 0, 0.65);',
+      '  border-color: rgba(255, 215, 0, 0.68);',
       '  color: #fef08a;',
       '}',
       '.radar-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }',
       '.radar-card {',
-      '  padding: 7px 8px;',
+      '  padding: 8px 9px;',
       '  border-radius: 9px;',
-      '  border: 1px solid rgba(148, 163, 184, 0.2);',
-      '  background: rgba(30, 41, 59, 0.52);',
+      '  border: 1px solid rgba(148, 163, 184, 0.22);',
+      '  background: rgba(30, 41, 59, 0.54);',
       '  cursor: pointer;',
       '  transition: border-color 0.12s ease, background 0.12s ease;',
       '  text-align: left;',
       '}',
       '.radar-card:hover { border-color: rgba(255, 215, 0, 0.55); }',
       '.radar-card.selected { border-color: #ffd700; background: rgba(245, 183, 0, 0.16); }',
-      '.radar-card.imminent { border-color: #ffd700; box-shadow: inset 0 0 10px rgba(255, 215, 0, 0.22); }',
-      '.radar-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px; }',
-      '.radar-name { font-size: 11px; color: #cbd5e1; font-weight: 600; }',
-      '.radar-rate { font-size: 10px; color: #94a3b8; font-variant-numeric: tabular-nums; }',
-      '.radar-dist { font-size: 14px; font-weight: 800; color: #f8fafc; font-variant-numeric: tabular-nums; }',
-      '.radar-dist.hot { color: #fde047; }',
-      '.radar-k { font-size: 10px; color: #94a3b8; font-variant-numeric: tabular-nums; }',
-      '.toolbar { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 11px; color: #94a3b8; }',
-      '.hits-wrap {',
-      '  max-height: 215px;',
+      '.radar-card.imminent {',
+      '  border-color: #ffd700;',
+      '  box-shadow: inset 0 0 12px rgba(255, 215, 0, 0.24), 0 0 8px rgba(255, 215, 0, 0.22);',
+      '}',
+      '.radar-title { font-size: 11px; color: #cbd5e1; font-weight: 700; margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }',
+      '.radar-dist { font-size: 14px; font-weight: 800; color: #f8fafc; font-variant-numeric: tabular-nums; margin-bottom: 2px; }',
+      '.radar-dist.hot { color: #ffd700; text-shadow: 0 0 8px rgba(255, 215, 0, 0.55); }',
+      '.radar-sub { font-size: 11px; color: #94a3b8; font-variant-numeric: tabular-nums; }',
+      '.toolbar {',
+      '  display: flex;',
+      '  align-items: center;',
+      '  justify-content: space-between;',
+      '  gap: 6px;',
+      '  padding: 2px 2px 0 2px;',
+      '  font-size: 11px;',
+      '  color: #94a3b8;',
+      '}',
+      '.section-title {',
+      '  font-size: 12px;',
+      '  font-weight: 800;',
+      '  color: #f1f5f9;',
+      '  font-variant-numeric: tabular-nums;',
+      '}',
+      '.clear-filter-btn {',
+      '  background: none;',
+      '  border: none;',
+      '  color: #fde047;',
+      '  font-size: 10.5px;',
+      '  cursor: pointer;',
+      '  padding: 0;',
+      '  text-decoration: underline;',
+      '}',
+      '.pred-list {',
+      '  max-height: 228px;',
       '  overflow-y: auto;',
       '  border: 1px solid rgba(148, 163, 184, 0.18);',
-      '  border-radius: 8px;',
-      '  background: rgba(15, 23, 42, 0.65);',
-      '}',
-      'table { width: 100%; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }',
-      'thead th {',
-      '  position: sticky;',
-      '  top: 0;',
-      '  background: rgba(30, 41, 59, 0.96);',
-      '  color: #94a3b8;',
-      '  text-align: left;',
-      '  padding: 5px 6px;',
-      '  font-weight: 600;',
-      '  border-bottom: 1px solid rgba(148, 163, 184, 0.2);',
-      '}',
-      'tbody td { padding: 5px 6px; border-bottom: 1px solid rgba(148, 163, 184, 0.1); }',
-      'tbody tr.row-next { background: rgba(255, 215, 0, 0.14); }',
-      'tbody tr.row-base { background: rgba(255, 215, 0, 0.08); }',
-      '.tag {',
-      '  display: inline-block;',
-      '  padding: 1px 6px;',
-      '  border-radius: 999px;',
-      '  font-size: 10px;',
-      '  font-weight: 700;',
-      '  white-space: nowrap;',
-      '}',
-      '.tier-base { background: linear-gradient(135deg, #fff2a1, #f5b700); color: #1f1400; }',
-      '.tier-berry { background: rgba(236, 72, 153, 0.25); color: #f9a8d4; border: 1px solid rgba(236, 72, 153, 0.45); }',
-      '.tier-parent { background: rgba(56, 189, 248, 0.22); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.45); }',
-      '.tier-pb { background: rgba(168, 85, 247, 0.22); color: #d8b4fe; border: 1px solid rgba(168, 85, 247, 0.45); }',
-      '.egg-list { display: flex; flex-direction: column; gap: 6px; max-height: 270px; overflow-y: auto; }',
-      '.egg-card {',
-      '  padding: 7px 9px;',
       '  border-radius: 9px;',
-      '  border: 1px solid rgba(148, 163, 184, 0.2);',
-      '  background: rgba(30, 41, 59, 0.5);',
+      '  background: rgba(15, 23, 42, 0.72);',
       '  display: flex;',
       '  flex-direction: column;',
-      '  gap: 3px;',
+      '}',
+      '.pred-row {',
+      '  display: flex;',
+      '  align-items: center;',
+      '  justify-content: space-between;',
+      '  gap: 8px;',
+      '  padding: 6px 9px;',
+      '  border-bottom: 1px solid rgba(148, 163, 184, 0.1);',
       '  font-variant-numeric: tabular-nums;',
+      '}',
+      '.pred-row:last-child { border-bottom: none; }',
+      '.pred-row.shiny-row { background: rgba(255, 215, 0, 0.09); }',
+      '.pred-left { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }',
+      '.pred-nth { font-weight: 700; color: #cbd5e1; font-size: 11px; white-space: nowrap; }',
+      '.pred-row.shiny-row .pred-nth { color: #fef08a; }',
+      '.normal-parent-text { font-size: 11px; color: #94a3b8; white-space: nowrap; }',
+      '.slot-badge {',
+      '  font-size: 11px;',
+      '  font-weight: 700;',
+      '  color: #fde047;',
+      '  white-space: nowrap;',
+      '}',
+      '.pred-right {',
+      '  font-size: 11px;',
+      '  color: #94a3b8;',
+      '  white-space: nowrap;',
+      '  text-align: right;',
+      '}',
+      '.pred-right.highlight {',
+      '  color: #ffd700;',
+      '  font-weight: 800;',
+      '  text-shadow: 0 0 8px rgba(255, 215, 0, 0.45);',
+      '}',
+      '.load-more-btn {',
+      '  width: 100%;',
+      '  padding: 8px 10px;',
+      '  border: none;',
+      '  border-top: 1px solid rgba(148, 163, 184, 0.16);',
+      '  background: rgba(30, 41, 59, 0.75);',
+      '  color: #fde047;',
+      '  font-size: 11.5px;',
+      '  font-weight: 700;',
+      '  cursor: pointer;',
+      '  text-align: center;',
+      '  transition: background 0.12s ease;',
+      '}',
+      '.load-more-btn:hover { background: rgba(51, 65, 85, 0.95); color: #fff; }',
+      /* 四種條件標籤：統一閃金色系 */
+      '.tag {',
+      '  display: inline-block;',
+      '  padding: 2px 7px;',
+      '  border-radius: 999px;',
+      '  font-size: 10.5px;',
+      '  font-weight: 800;',
+      '  white-space: nowrap;',
+      '  line-height: 1.2;',
+      '}',
+      /* 普通親代：亮金底深棕字 + 金色發光邊框 */
+      '.tier-base {',
+      '  background: #ffd700;',
+      '  color: #2b1700;',
+      '  border: 1px solid #fff5a8;',
+      '  box-shadow: 0 0 8px rgba(255, 215, 0, 0.78);',
+      '}',
+      /* 吃果普通親代：漸層閃金底深棕字 + 柔和金光 */
+      '.tier-berry {',
+      '  background: linear-gradient(135deg, #fff2a6 0%, #f5b700 100%);',
+      '  color: #2b1700;',
+      '  border: 1px solid #fde047;',
+      '  box-shadow: 0 0 6px rgba(245, 183, 0, 0.45);',
+      '}',
+      /* 閃光親代：深底金色邊框 + 金色字體 */
+      '.tier-parent {',
+      '  background: rgba(42, 30, 6, 0.92);',
+      '  color: #ffd700;',
+      '  border: 1px solid #f5b700;',
+      '}',
+      /* 吃果閃光親代：淡香檳金底深棕字 + 金色細框 */
+      '.tier-pb {',
+      '  background: #f3e3b2;',
+      '  color: #362000;',
+      '  border: 1px solid #d4af37;',
+      '}',
+      /* 持有蛋頁籤：固定 2x2 四宮格卡片（比照序列預測上方四張摘要卡） */
+      '.egg-grid {',
+      '  display: grid;',
+      '  grid-template-columns: repeat(2, 1fr);',
+      '  gap: 8px;',
+      '}',
+      '.egg-card {',
+      '  display: flex;',
+      '  align-items: center;',
+      '  justify-content: space-between;',
+      '  gap: 6px;',
+      '  width: 100%;',
+      '  min-height: 62px;',
+      '  height: 62px;',
+      '  padding: 6px 10px;',
+      '  border-radius: 9px;',
+      '  background: rgba(30, 41, 59, 0.54);',
+      '  border: 1px solid rgba(148, 163, 184, 0.22);',
+      '  overflow: hidden;',
       '}',
       '.egg-card.shiny {',
       '  border: 1.5px solid #ffd700;',
-      '  background: linear-gradient(135deg, rgba(255, 215, 0, 0.18), rgba(30, 41, 59, 0.72));',
-      '  box-shadow: 0 0 12px rgba(255, 215, 0, 0.28);',
+      '  background: linear-gradient(135deg, rgba(45, 32, 8, 0.85) 0%, rgba(30, 41, 59, 0.72) 100%);',
+      '  box-shadow: inset 0 0 12px rgba(255, 215, 0, 0.22), 0 0 10px rgba(255, 215, 0, 0.24);',
       '}',
-      '.egg-row { display: flex; justify-content: space-between; align-items: center; gap: 6px; }',
-      '.egg-sub { font-size: 10px; color: #94a3b8; }',
-      '.dom-status {',
-      '  font-size: 11px;',
-      '  padding: 5px 8px;',
-      '  border-radius: 7px;',
-      '  background: rgba(30, 41, 59, 0.6);',
-      '  border: 1px solid rgba(148, 163, 184, 0.16);',
-      '  color: #cbd5e1;',
+      '.egg-card.empty-slot {',
+      '  justify-content: center;',
+      '  background: rgba(30, 41, 59, 0.34);',
+      '  border: 1px solid rgba(148, 163, 184, 0.14);',
       '}',
-      '.dom-status.ok { border-color: rgba(255, 215, 0, 0.55); color: #fde047; }',
+      '.egg-empty-text {',
+      '  font-size: 12px;',
+      '  font-weight: 600;',
+      '  color: #64748b;',
+      '  letter-spacing: 0.5px;',
+      '}',
+      '.egg-left {',
+      '  display: flex;',
+      '  flex-direction: column;',
+      '  justify-content: center;',
+      '  align-items: flex-start;',
+      '  gap: 3px;',
+      '  min-width: 0;',
+      '  flex: 1 1 auto;',
+      '  overflow: hidden;',
+      '}',
+      '.egg-name {',
+      '  font-size: 13px;',
+      '  font-weight: 800;',
+      '  color: #f1f5f9;',
+      '  white-space: nowrap;',
+      '  overflow: hidden;',
+      '  text-overflow: ellipsis;',
+      '  max-width: 100%;',
+      '}',
+      '.egg-card.shiny .egg-name { color: #fef08a; }',
       '.empty { padding: 16px 8px; text-align: center; color: #94a3b8; }',
       '.debug-box {',
       '  padding: 7px 8px;',
       '  border-radius: 8px;',
-      '  background: rgba(2, 6, 23, 0.75);',
-      '  border: 1px solid rgba(148, 163, 184, 0.2);',
+      '  background: rgba(2, 6, 23, 0.82);',
+      '  border: 1px solid rgba(148, 163, 184, 0.22);',
       '  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;',
       '  font-size: 10px;',
       '  color: #94a3b8;',
       '  word-break: break-all;',
-      '  line-height: 1.45;',
+      '  line-height: 1.48;',
+      '  max-height: 160px;',
+      '  overflow-y: auto;',
+      '  user-select: text;',
       '}',
       '.footer {',
       '  display: flex;',
       '  justify-content: space-between;',
       '  align-items: center;',
-      '  padding: 5px 10px;',
+      '  padding: 5px 11px;',
       '  border-top: 1px solid rgba(148, 163, 184, 0.14);',
-      '  background: rgba(15, 23, 42, 0.8);',
+      '  background: rgba(15, 23, 42, 0.85);',
       '  font-size: 10px;',
       '  color: #64748b;',
       '}',
@@ -1188,34 +1627,103 @@
     applyHostPosition();
   }
 
-  function renderUI(fromPoll) {
-    ensureHost();
-    if (fromPoll && shadowRoot.activeElement && shadowRoot.activeElement.id === 'pkc-k-input') {
-      return;
+  function renderMonRow(slotLabel, mon) {
+    var nameHtml = '';
+    if (mon.domName && (!mon.isDitto || mon.domName !== '百變怪')) {
+      nameHtml = '<span class="mon-name">' + escapeHtml(mon.domName) + '</span>';
     }
+
+    var midHtml = '';
+    if (mon.lv != null || mon.expWidth) {
+      midHtml =
+        '<div class="mon-mid">' +
+        '<div class="mon-lv-row">' +
+        '<span class="mon-lv">' + (mon.lv != null ? 'Lv.' + mon.lv : '') + '</span>' +
+        (mon.expLabel ? '<span class="mon-exp-pct">' + escapeHtml(mon.expLabel) + '</span>' : '') +
+        '</div>' +
+        (mon.expWidth
+          ? '<div class="mon-gauge"><i class="mon-gauge-fill" style="width:' + escapeHtml(mon.expWidth) + ';"></i></div>'
+          : '') +
+        '</div>';
+    }
+
+    var imgClass = 'mon-avatar' + (mon.isStaticFallback ? ' fallback-scale' : '');
+
+    return (
+      '<div class="mon-row' + (mon.shiny ? ' shiny' : '') + '">' +
+      '<div class="mon-left">' +
+      '<span class="mon-slot">' + escapeHtml(slotLabel) + '</span>' +
+      nameHtml +
+      (mon.shiny ? '<span class="shiny-mark">✦閃光</span>' : '') +
+      '</div>' +
+      midHtml +
+      '<div class="mon-avatar-box">' +
+      '<img class="' + imgClass + '" src="' + escapeHtml(mon.imgSrc) + '" alt="">' +
+      '</div>' +
+      '</div>'
+    );
+  }
+
+  function renderPensionSection(pensionInfo) {
+    if (!pensionInfo) return '';
+    var html = '<div class="pension-box">';
+    html += '<div class="pension-summary">培育屋：' + escapeHtml(pensionInfo.summaryText) + '</div>';
+
+    if (pensionInfo.allMons.length > 0) {
+      html += '<div class="pension-list">';
+      for (var d = 0; d < pensionInfo.dittos.length; d++) {
+        html += renderMonRow('百變怪', pensionInfo.dittos[d]);
+      }
+      for (var p = 0; p < pensionInfo.parentPool.length; p++) {
+        var pm = pensionInfo.parentPool[p];
+        html += renderMonRow(pm.slotNum + '號位', pm);
+      }
+      for (var b = 0; b < pensionInfo.blockedMons.length; b++) {
+        html += renderMonRow('不可生蛋', pensionInfo.blockedMons[b]);
+      }
+      html += '</div>';
+    }
+
+    for (var w = 0; w < pensionInfo.warnings.length; w++) {
+      html += '<div class="pension-warn">⚠️ ' + escapeHtml(pensionInfo.warnings[w]) + '</div>';
+    }
+    html += '</div>';
+    return html;
+  }
+
+  function renderUI() {
+    ensureHost();
+
+    // 重繪前記錄列表與主體的 scrollTop，重繪後立即還原
+    var prevPredList = shadowRoot.getElementById('pkc-pred-list');
+    var prevEggList = shadowRoot.getElementById('pkc-egg-list');
+    var prevBody = shadowRoot.getElementById('pkc-panel-body');
+    var savedPredScroll = prevPredList ? prevPredList.scrollTop : 0;
+    var savedEggScroll = prevEggList ? prevEggList.scrollTop : 0;
+    var savedBodyScroll = prevBody ? prevBody.scrollTop : 0;
 
     var state = currentState;
     var hasShinyHeld = !!(state && state.shinyEggs.length > 0);
-    var effectiveK = state ? (uiState.manualK != null ? uiState.manualK : state.autoNextK) : 0;
-    var pred = state ? predictSequence(state.save, effectiveK, uiState.scanLimit, uiState.filterTier) : null;
+    var pred = state ? predictSequence(state, uiState.filterTier) : null;
+
+    lastRenderSig = computeRenderSignature(state);
 
     var html = '<style>' + getShadowStyles() + '</style>';
 
     if (uiState.collapsed) {
       var pillDist = '—';
-      if (pred) {
-        var activeNearest =
-          uiState.filterTier !== 'all' && pred.nearest[uiState.filterTier]
-            ? pred.nearest[uiState.filterTier]
-            : pred.nearest.parentBerry;
-        pillDist = activeNearest ? (activeNearest.offset === 0 ? '下顆✨' : '+' + (activeNearest.offset + 1)) : '—';
+      if (pred && pred.earliestShiny) {
+        pillDist = pred.earliestShiny.step === 0
+          ? '下一顆是！'
+          : '再過 ' + pred.earliestShiny.step + ' 顆';
       }
       html +=
         '<div class="pill' + (hasShinyHeld ? ' has-shiny' : '') + '" id="pkc-expand">' +
         '<span>🥚 色違預測</span>' +
+        (state ? '<span class="pill-badge">k=' + state.laid + '</span>' : '') +
         (hasShinyHeld
           ? '<span class="pill-badge gold">持有 ✨' + state.shinyEggs.length + '</span>'
-          : '<span class="pill-badge">蛋 ' + (state ? state.eggs.length : 0) + '</span>') +
+          : '') +
         '<span class="pill-badge">' + escapeHtml(pillDist) + '</span>' +
         '</div>';
 
@@ -1241,47 +1749,23 @@
       '</div>' +
       '</div>';
 
-    html += '<div class="body">';
+    html += '<div class="body" id="pkc-panel-body">';
 
     if (!state) {
       html +=
         '<div class="empty">尚無 <code>' + escapeHtml(SAVE_KEY) + '</code> 存檔資料<br>請進入遊戲建立或載入存檔後自動偵測</div>';
     } else {
-      // Seed 與 k 控制列
+      // 1. 頂部第一列：目前孵蛋數 k={laid}、靛莓果：已吃 / 未吃
       html +=
-        '<div class="meta-bar">' +
-        '<div class="seed-text" title="trainerSeed: ' + escapeHtml(state.seed) + '">Seed: ' + escapeHtml(state.seed) + '</div>' +
-        '<div class="k-ctrl">' +
-        '<span style="font-size:11px;color:#94a3b8;">k=</span>' +
-        '<button class="mini-btn" id="pkc-k-dec" title="k - 1">-1</button>' +
-        '<input class="k-input" id="pkc-k-input" type="number" min="0" step="1" value="' + effectiveK + '">' +
-        '<button class="mini-btn" id="pkc-k-inc" title="k + 1">+1</button>' +
-        (uiState.manualK != null
-          ? '<button class="mini-btn active" id="pkc-k-reset" title="恢復自動偵測">自動</button>'
-          : '') +
+        '<div class="status-bar">' +
+        '<div class="status-k">目前孵蛋數 <strong>k=' + state.laid + '</strong></div>' +
+        '<div class="status-bx' + (state.berryActive ? ' eaten' : '') + '">' +
+        '靛莓果：' + (state.berryActive ? '已吃' : '未吃') +
         '</div>' +
         '</div>';
 
-      // 培育屋親代狀態提示（套用 DITTO_ID / NO_EGG_IDS）
-      if (state.daycare) {
-        var pNames = state.daycare.parents
-          .map(function (p) {
-            return (p.shiny ? '✨' : '') + p.name;
-          })
-          .join(' × ');
-        html += '<div class="daycare-box">';
-        html +=
-          '<div class="egg-row"><span>培育屋：' +
-          escapeHtml(pNames || '已偵測') +
-          '</span><span>' +
-          (state.daycare.hasShinyParent ? '<span class="tag tier-parent">sp=2</span> ' : '') +
-          (state.daycare.berryActive ? '<span class="tag tier-berry">bx=1</span>' : '') +
-          '</span></div>';
-        for (var w = 0; w < state.daycare.warnings.length; w++) {
-          html += '<div class="daycare-warn">⚠️ ' + escapeHtml(state.daycare.warnings[w]) + '</div>';
-        }
-        html += '</div>';
-      }
+      // 2. 培育屋親代顯示（三段式佈局 + 右側 48x48 垂直置中最大化寶可夢圖片）
+      html += renderPensionSection(state.pensionInfo);
 
       // 分頁切換
       html +=
@@ -1293,109 +1777,115 @@
         '</div>';
 
       if (uiState.activeTab === 'predict') {
-        // 4 層機率雷達卡
+        // 3. 上方 4 張摘要卡（維持往後找各自檔位第一筆色違）
         html += '<div class="radar-grid">';
         for (var t = 0; t < TIERS.length; t++) {
           var tier = TIERS[t];
           var hit = pred.nearest[tier.id];
           var isSel = uiState.filterTier === tier.id;
-          var isHot = !!(hit && hit.offset === 0);
+          var isHot = !!(hit && hit.step === 0);
+          var subText = hit
+            ? 'k=' + hit.k + (hit.slotNum != null ? ' · ' + hit.slotNum + '號位' : '')
+            : '範圍內無命中';
+
           html +=
-            '<button class="radar-card' +
+            '<button type="button" class="radar-card' +
             (isSel ? ' selected' : '') +
             (isHot ? ' imminent' : '') +
             '" data-tier="' + tier.id + '">' +
-            '<div class="radar-top"><span class="radar-name">' + tier.label + '</span><span class="radar-rate">' + tier.rateText + '</span></div>' +
-            '<div class="radar-dist' + (isHot ? ' hot' : '') + '">' + formatDist(hit) + '</div>' +
-            '<div class="radar-k">' + (hit ? 'k=' + hit.k + ' · ' + formatRoll(hit.roll) : '掃描內無命中') + '</div>' +
+            '<div class="radar-title">' + escapeHtml(tier.cardTitle) + '</div>' +
+            '<div class="radar-dist' + (isHot ? ' hot' : '') + '">' + escapeHtml(formatCardMainDist(hit)) + '</div>' +
+            '<div class="radar-sub">' + escapeHtml(subText) + '</div>' +
             '</button>';
         }
         html += '</div>';
 
-        // 篩選與掃描範圍工具列
+        // 區塊標題：生蛋預測（1000顆內）
         html +=
           '<div class="toolbar">' +
-          '<div>' +
-          '<button class="mini-btn' + (uiState.filterTier === 'all' ? ' active' : '') + '" id="pkc-filter-all">全部命中</button>' +
-          '</div>' +
-          '<div style="display:flex;align-items:center;gap:4px;">' +
-          '<span>範圍</span>' +
-          [500, 2000, 5000]
-            .map(function (lim) {
-              return (
-                '<button class="mini-btn' +
-                (uiState.scanLimit === lim ? ' active' : '') +
-                '" data-limit="' + lim + '">' + lim + '</button>'
-              );
-            })
-            .join('') +
-          '</div>' +
+          '<div class="section-title">生蛋預測（' + LIST_TOTAL_EGGS + '顆內）</div>' +
+          (uiState.filterTier !== 'all'
+            ? '<button type="button" class="clear-filter-btn" id="pkc-clear-filter">顯示全部蛋序</button>'
+            : '') +
           '</div>';
 
-        // 預測序列列表
-        html += '<div class="hits-wrap">';
-        if (pred.hits.length === 0) {
-          html += '<div class="empty">目前範圍內無符合條件的色違序列</div>';
+        // 4. 下方生蛋預測列表（顯示全部蛋序，分批每次 200 筆）
+        html += '<div class="pred-list" id="pkc-pred-list">';
+        if (pred.rows.length === 0) {
+          html += '<div class="empty">目前 ' + LIST_TOTAL_EGGS + ' 顆範圍內無符合條件的結果</div>';
         } else {
-          html +=
-            '<table><thead><tr><th>次序</th><th>k</th><th>最低條件</th><th>Roll</th></tr></thead><tbody>';
-          for (var h = 0; h < pred.hits.length; h++) {
-            var row = pred.hits[h];
-            var rowCls =
-              row.offset === 0
-                ? 'row-next'
-                : row.minTier && row.minTier.id === 'base'
-                  ? 'row-base'
-                  : '';
-            var nthText = row.offset === 0 ? '下一顆' : '+' + row.nth;
-            html +=
-              '<tr class="' + rowCls + '">' +
-              '<td>' + nthText + '</td>' +
-              '<td>' + row.k + '</td>' +
-              '<td><span class="tag ' + row.minTier.badgeClass + '">' + row.minTier.shortLabel + '</span></td>' +
-              '<td>' + formatRoll(row.roll) + '</td>' +
-              '</tr>';
+          for (var h = 0; h < pred.rows.length; h++) {
+            var row = pred.rows[h];
+            var isShinyRow = !!row.minTier;
+            var isImmediate = row.step === 0;
+
+            if (isShinyRow) {
+              var shinyRight = isImmediate
+                ? '下一顆是 · k=' + row.k
+                : '再過 ' + row.step + ' 顆 · k=' + row.k;
+              var shinySlotLabel = row.slotNum != null
+                ? '[' + row.slotNum + '號位' + (row.slotName ? '·' + row.slotName : '') + ']'
+                : '';
+
+              html +=
+                '<div class="pred-row shiny-row">' +
+                '<div class="pred-left">' +
+                '<span class="pred-nth">第 ' + (row.step + 1) + ' 顆</span>' +
+                '<span class="tag ' + row.minTier.badgeClass + '">' + escapeHtml(row.minTier.tagName) + '</span>' +
+                (shinySlotLabel ? '<span class="slot-badge">' + escapeHtml(shinySlotLabel) + '</span>' : '') +
+                '</div>' +
+                '<div class="pred-right highlight">' + escapeHtml(shinyRight) + '</div>' +
+                '</div>';
+            } else {
+              var normalRight = isImmediate
+                ? '下一顆 · k=' + row.k
+                : '再過 ' + row.step + ' 顆 · k=' + row.k;
+              var normalSlotLabel = row.slotName
+                ? row.slotName + (row.slotNum != null ? ' [' + row.slotNum + '號位]' : '')
+                : (row.slotNum != null ? '[' + row.slotNum + '號位]' : '');
+
+              html +=
+                '<div class="pred-row">' +
+                '<div class="pred-left">' +
+                '<span class="pred-nth">第 ' + (row.step + 1) + ' 顆</span>' +
+                (normalSlotLabel ? '<span class="normal-parent-text">' + escapeHtml(normalSlotLabel) + '</span>' : '') +
+                '</div>' +
+                '<div class="pred-right">' + escapeHtml(normalRight) + '</div>' +
+                '</div>';
+            }
           }
-          html += '</tbody></table>';
+
+          if (pred.hasMore) {
+            var nextBatch = Math.min(LIST_PAGE_SIZE, pred.totalRows - pred.rows.length);
+            html +=
+              '<button type="button" class="load-more-btn" id="pkc-load-more">' +
+              '顯示更多（+' + nextBatch + ' 筆 · 目前 ' + pred.rows.length + '/' + pred.totalRows + '）' +
+              '</button>';
+          }
         }
         html += '</div>';
       } else {
-        // 持有蛋清單 + DOM 金框狀態
-        var domText =
-          state.shinyEggs.length === 0
-            ? '目前未持有色違蛋'
-            : lastDomMatchInfo.matched > 0
-              ? 'DOM 金框提示：已標記 ' + lastDomMatchInfo.matched + ' / ' + lastDomMatchInfo.totalShiny + ' 顆色違蛋'
-              : 'DOM 金框提示：持有 ' + state.shinyEggs.length + ' 顆色違蛋（切換至蛋介面即自動上金框）';
-        html += '<div class="dom-status' + (lastDomMatchInfo.matched > 0 ? ' ok' : '') + '">' + escapeHtml(domText) + '</div>';
-
-        html += '<div class="egg-list">';
-        if (state.eggs.length === 0) {
-          html += '<div class="empty">目前存檔中沒有持有任何蛋</div>';
-        } else {
-          for (var e = 0; e < state.eggs.length; e++) {
-            var eg = state.eggs[e];
-            var titleStr =
-              '#' + (eg.index + 1) + ' ' +
-              (eg.name ? eg.name : eg.speciesId != null ? '寶可夢 #' + eg.speciesId : '蛋');
-            var flags = [];
-            if (eg.sp === 2) flags.push('親代(1/16)');
-            else if (eg.sp) flags.push('舊親代(10%)');
-            if (eg.bx) flags.push('色違果×2');
-            if (flags.length === 0) flags.push('一般');
-
+        // 持有蛋頁籤：固定 2x2 四宮格卡片（比照序列預測上方四張摘要卡，永遠固定渲染 4 個蛋位）
+        html += '<div class="egg-grid" id="pkc-egg-list">';
+        for (var slotIdx = 0; slotIdx < 4; slotIdx++) {
+          var eg = slotIdx < state.eggs.length ? state.eggs[slotIdx] : null;
+          if (eg) {
             html +=
               '<div class="egg-card' + (eg.isShiny ? ' shiny' : '') + '">' +
-              '<div class="egg-row">' +
-              '<strong>' + escapeHtml(titleStr) + '</strong>' +
-              (eg.isShiny
-                ? '<span class="tag tier-base">✨ 色違蛋</span>'
-                : '<span class="egg-sub">一般</span>') +
+              '<div class="egg-left">' +
+              '<span class="egg-name">' + escapeHtml(eg.displayName) + '</span>' +
+              (eg.isShiny ? '<span class="shiny-mark">✦閃光</span>' : '') +
               '</div>' +
-              '<div class="egg-row egg-sub">' +
-              '<span>' + escapeHtml(eg.method) + ' · ' + escapeHtml(flags.join(' + ')) + '</span>' +
-              '<span>' + (eg.roll != null ? formatRoll(eg.roll) + ' / ' + eg.th.toFixed(4) : '固定旗標') + '</span>' +
+              '<div class="mon-avatar-box">' +
+              (eg.imgSrc
+                ? '<img class="mon-avatar fallback-scale" src="' + escapeHtml(eg.imgSrc) + '" alt="">'
+                : '') +
               '</div>' +
+              '</div>';
+          } else {
+            html +=
+              '<div class="egg-card empty-slot">' +
+              '<span class="egg-empty-text">沒蛋</span>' +
               '</div>';
           }
         }
@@ -1403,12 +1893,23 @@
       }
 
       if (uiState.showDebug) {
+        var firstMonKeysText =
+          state.pensionInfo && state.pensionInfo.firstMonKeys && state.pensionInfo.firstMonKeys.length > 0
+            ? state.pensionInfo.firstMonKeys.join(', ')
+            : '（無親代資料）';
+        var firstEntryKeysText =
+          state.pensionInfo && state.pensionInfo.firstEntryKeys && state.pensionInfo.firstEntryKeys.length > 0
+            ? state.pensionInfo.firstEntryKeys.join(', ')
+            : '（無親代資料）';
         html +=
           '<div class="debug-box">' +
-          'trainerSeed: ' + escapeHtml(state.seed) + '<br>' +
-          'eggsPath: ' + escapeHtml(state.eggsPath) + ' (' + state.eggs.length + ')<br>' +
-          'kSource: ' + escapeHtml(state.kSource) + '<br>' +
-          'topKeys: ' + escapeHtml(state.topKeys.join(', ')) +
+          '<strong>Seed (trainerSeed):</strong> ' + escapeHtml(state.seed) + '<br>' +
+          '<strong>k 來源:</strong> ' + escapeHtml(state.kSource) + '<br>' +
+          '<strong>Object.keys(save):</strong> ' + escapeHtml(state.topKeys.join(', ')) + '<br>' +
+          '<strong>Object.keys(pension.mons[0]):</strong> ' + escapeHtml(firstEntryKeysText) + '<br>' +
+          '<strong>Object.keys(mon):</strong> ' + escapeHtml(firstMonKeysText) + '<br>' +
+          '<strong>save.pension 摘要:</strong><br>' +
+          escapeHtml(JSON.stringify(state.pensionDebugSummary, null, 2)) +
           '</div>';
       }
     }
@@ -1416,14 +1917,30 @@
     html += '</div>'; // .body
     html +=
       '<div class="footer">' +
-      '<span>唯讀本地運算 · 零網路請求</span>' +
-      '<button class="link-btn" id="pkc-toggle-debug">' + (uiState.showDebug ? '隱藏除錯' : '除錯資訊') + '</button>' +
+      '<span>' + (state ? 'Seed: ' + escapeHtml(state.seed) : '唯讀本地運算') + '</span>' +
+      '<button type="button" class="link-btn" id="pkc-toggle-debug">' + (uiState.showDebug ? '收起除錯資訊' : '除錯資訊') + '</button>' +
       '</div>';
     html += '</div>'; // .panel
 
     shadowRoot.innerHTML = html;
 
-    // 綁定事件
+    // 立即還原滾動條位置（防止彈回頂部）
+    var newBody = shadowRoot.getElementById('pkc-panel-body');
+    if (newBody && savedBodyScroll > 0) newBody.scrollTop = savedBodyScroll;
+    var newPredList = shadowRoot.getElementById('pkc-pred-list');
+    if (newPredList && savedPredScroll > 0) newPredList.scrollTop = savedPredScroll;
+    var newEggList = shadowRoot.getElementById('pkc-egg-list');
+    if (newEggList && savedEggScroll > 0) newEggList.scrollTop = savedEggScroll;
+
+    // 綁定圖片載入失敗隱藏（CSP 安全）
+    var avatars = shadowRoot.querySelectorAll('.mon-avatar');
+    for (var av = 0; av < avatars.length; av++) {
+      avatars[av].addEventListener('error', function () {
+        this.style.display = 'none';
+      });
+    }
+
+    // 綁定互動事件
     attachDragHandler(shadowRoot.getElementById('pkc-drag-header'));
 
     var collapseBtn = shadowRoot.getElementById('pkc-collapse');
@@ -1464,93 +1981,71 @@
       radarCards[rc].addEventListener('click', function () {
         var tid = this.getAttribute('data-tier');
         uiState.filterTier = uiState.filterTier === tid ? 'all' : tid;
+        uiState.visibleCount = LIST_PAGE_SIZE;
         saveUiPrefs();
         renderUI();
       });
     }
 
-    var allFilterBtn = shadowRoot.getElementById('pkc-filter-all');
-    if (allFilterBtn) {
-      allFilterBtn.addEventListener('click', function () {
+    var clearFilterBtn = shadowRoot.getElementById('pkc-clear-filter');
+    if (clearFilterBtn) {
+      clearFilterBtn.addEventListener('click', function () {
         uiState.filterTier = 'all';
+        uiState.visibleCount = LIST_PAGE_SIZE;
         saveUiPrefs();
         renderUI();
       });
     }
 
-    var limitBtns = shadowRoot.querySelectorAll('[data-limit]');
-    for (var lb = 0; lb < limitBtns.length; lb++) {
-      limitBtns[lb].addEventListener('click', function () {
-        uiState.scanLimit = parseInt(this.getAttribute('data-limit'), 10) || 2000;
-        saveUiPrefs();
-        renderUI();
-      });
-    }
-
-    var kDec = shadowRoot.getElementById('pkc-k-dec');
-    if (kDec) {
-      kDec.addEventListener('click', function () {
-        uiState.manualK = Math.max(0, effectiveK - 1);
-        renderUI();
-      });
-    }
-
-    var kInc = shadowRoot.getElementById('pkc-k-inc');
-    if (kInc) {
-      kInc.addEventListener('click', function () {
-        uiState.manualK = effectiveK + 1;
-        renderUI();
-      });
-    }
-
-    var kReset = shadowRoot.getElementById('pkc-k-reset');
-    if (kReset) {
-      kReset.addEventListener('click', function () {
-        uiState.manualK = null;
-        renderUI();
-      });
-    }
-
-    var kInput = shadowRoot.getElementById('pkc-k-input');
-    if (kInput) {
-      kInput.addEventListener('change', function () {
-        var parsed = parseInt(this.value, 10);
-        if (Number.isInteger(parsed) && parsed >= 0) {
-          uiState.manualK = parsed;
-        } else {
-          uiState.manualK = null;
-        }
+    var loadMoreBtn = shadowRoot.getElementById('pkc-load-more');
+    if (loadMoreBtn) {
+      loadMoreBtn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        uiState.visibleCount = Math.min(LIST_TOTAL_EGGS, uiState.visibleCount + LIST_PAGE_SIZE);
         renderUI();
       });
     }
   }
 
   // ============================================================================
-  // 輪詢與 DOM 變化監聽（僅在頁面可見時低耗執行）
+  // 輪詢與 DOM 變化監聽（簽名比對，無變更絕不重繪 DOM）
   // ============================================================================
   function scheduleDomSync() {
-    if (!currentState || currentState.shinyEggs.length === 0) return;
+    if (!currentState) return;
     if (mutationTimer) return;
     mutationTimer = window.setTimeout(function () {
       mutationTimer = null;
-      var prevMatched = lastDomMatchInfo.matched;
-      var info = syncDomHighlights(currentState);
-      if (info.matched !== prevMatched && !uiState.collapsed && uiState.activeTab === 'eggs') {
-        renderUI();
+      var pension = currentState.save && currentState.save.pension ? currentState.save.pension : null;
+      refreshDomPensionInfo(pension);
+      syncDomHighlights(currentState);
+
+      if (currentState.save) {
+        var nextState = extractGameState(currentState.save);
+        var nextSig = computeRenderSignature(nextState);
+        if (nextSig !== lastRenderSig) {
+          currentState = nextState;
+          renderUI();
+        }
       }
-    }, 180);
+    }, 200);
   }
 
-  function refreshFromSave(force) {
+  function refreshFromSave(forceRender) {
     var raw = readRawSave();
-    if (!force && raw === lastRawSave) {
+    if (!forceRender && raw === lastRawSave) {
       return;
     }
     lastRawSave = raw;
     var save = parseSaveRaw(raw);
-    currentState = save ? extractGameState(save) : null;
+    var nextState = save ? extractGameState(save) : null;
+    currentState = nextState;
     syncDomHighlights(currentState);
-    renderUI(!force);
+
+    var nextSig = computeRenderSignature(currentState);
+    if (!forceRender && nextSig === lastRenderSig) {
+      return;
+    }
+    renderUI();
   }
 
   function startWatching() {
@@ -1563,7 +2058,7 @@
 
     window.addEventListener('storage', function (e) {
       if (!e || e.key === SAVE_KEY || e.key === null) {
-        refreshFromSave(true);
+        refreshFromSave(false);
       }
     });
 
@@ -1580,7 +2075,7 @@
 
     if (typeof MutationObserver !== 'undefined' && document.body) {
       observer = new MutationObserver(function (mutations) {
-        if (!currentState || currentState.shinyEggs.length === 0) return;
+        if (!currentState) return;
         for (var i = 0; i < mutations.length; i++) {
           var target = mutations[i].target;
           if (target && !isInsideOurHost(target)) {
