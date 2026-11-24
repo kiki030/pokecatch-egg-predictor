@@ -1,17 +1,11 @@
 {
   "manifest_version": 3,
   "name": "PokéCatch 本地孵蛋色違預測",
-  "version": "1.0.0",
-  "description": "純本地、零依賴的 PokéCatch 孵蛋色違序列預測與色違蛋金框提示（唯讀存檔，不修改資料、不發送網路請求）。",
-  "permissions": ["storage"],
-  "content_scripts": [
-    {
-      "matches": [
-        "https://pokecatch-online.netlify.app/*",
-        "https://pokecatch-online.pages.dev/*"
-      ],
-      "js": ["content.js"],
-      "run_at": "document_idle"
-    }
-  ]
+  "version": "1.1.0",
+  "description": "純本地、零依賴的 PokéCatch 孵蛋色違序列預測 Popup 工具（平時不注入遊戲頁面，點擊圖示時按需唯讀存檔，不修改資料、不發送網路請求）。",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "PokéCatch 本地孵蛋色違預測"
+  }
 }
