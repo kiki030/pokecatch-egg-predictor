@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>PokéCatch 孵蛋色違預測 v2.0（離線版）</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-icon" aria-hidden="true">🥚</span>
+        <div>
+          <h1>PokéCatch 孵蛋色違預測</h1>
+          <p class="subtitle">v2.0 完全離線獨立版 · 零網路請求 · 純本地儲存</p>
+        </div>
+      </div>
+      <div class="header-pill" id="next-slot-pill">下一顆：1號位</div>
+    </header>
+
+    <main class="layout-grid">
+      <!-- 左側／上方：狀態設定、培育屋配置、2x2 重點摘要 -->
+      <div class="col-left">
+        <!-- 1. 狀態與手動計數區 -->
+        <section class="card" aria-label="狀態與計數">
+          <div class="card-head">
+            <h2>狀態與產蛋計數</h2>
+            <button type="button" class="text-btn" id="btn-seed-toggle">編輯 Seed</button>
+          </div>
+
+          <div class="seed-row">
+            <label for="input-seed" class="field-label">訓練家 Seed</label>
+            <div class="seed-input-wrap">
+              <input
+                id="input-seed"
+                type="text"
+                inputmode="text"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="例：1794493981827:15950"
+              >
+              <button type="button" class="btn-secondary btn-sm" id="btn-seed-save">儲存</button>
+            </div>
+            <p class="field-hint" id="seed-hint">格式為 <code>trainer.since:trainer.id</code>，已鎖定防誤觸。</p>
+          </div>
+
+          <div class="counter-box">
+            <div class="counter-top">
+              <div>
+                <span class="counter-label">目前孵蛋數（laid）</span>
+                <div class="counter-value-row">
+                  <span class="k-prefix">k =</span>
+                  <input
+                    id="input-k"
+                    class="k-input"
+                    type="number"
+                    inputmode="numeric"
+                    min="0"
+                    step="1"
+                    value="0"
+                    aria-label="目前孵蛋數 k"
+                  >
+                </div>
+              </div>
+
+              <label class="berry-switch" for="toggle-berry">
+                <input id="toggle-berry" type="checkbox">
+                <span class="switch-track"><span class="switch-thumb"></span></span>
+                <span class="switch-text" id="berry-label">靛莓果：未吃</span>
+              </label>
+            </div>
+
+            <div class="counter-actions">
+              <button type="button" class="btn-minus" id="btn-k-minus">-1 修正</button>
+              <button type="button" class="btn-plus" id="btn-k-plus">+1 產蛋</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- 2. 培育屋親代配置器 -->
+        <section class="card" aria-label="培育屋親代配置">
+          <div class="card-head">
+            <h2>培育屋親代配置 <span class="muted-count" id="parent-count-label">(1/3)</span></h2>
+            <button type="button" class="btn-secondary btn-sm" id="btn-add-parent">+ 新增親代</button>
+          </div>
+          <p class="section-desc">設定 1～3 隻可產蛋親代（不含百變怪），系統會即時依 <code>k % 親代數</code> 推算欄位落點與是否錯過色違。</p>
+          <div class="parent-list" id="parent-list"></div>
+        </section>
+
+        <!-- 3. 重點摘要卡片（2x2 網格） -->
+        <section class="card" aria-label="四檔色違重點摘要">
+          <div class="card-head">
+            <h2>距離下一次色違</h2>
+            <span class="muted-count">互斥區間 · 各自最近一筆</span>
+          </div>
+          <div class="radar-grid" id="radar-grid"></div>
+        </section>
+      </div>
+
+      <!-- 右側／下方：閃光蛋預測序列 -->
+      <div class="col-right">
+        <section class="card sequence-card" aria-label="閃光蛋預測序列">
+          <div class="card-head">
+            <h2>閃光蛋預測序列 <span class="muted-count" id="seq-count-label">(2000顆內)</span></h2>
+          </div>
+
+          <div class="filter-bar" id="filter-bar" role="tablist" aria-label="序列篩選">
+            <button type="button" class="filter-chip active" data-filter="all">全部色違</button>
+            <button type="button" class="filter-chip" data-filter="noBerry">只看未吃果</button>
+            <button type="button" class="filter-chip" data-filter="currentHit">目前配置命中</button>
+            <button type="button" class="filter-chip" data-filter="missed">會錯過提醒</button>
+          </div>
+
+          <div class="seq-list" id="seq-list"></div>
+        </section>
+      </div>
+    </main>
+
+    <footer class="app-footer">
+      <span>所有設定皆僅存於本機瀏覽器 <code>localStorage</code>，不連線至任何外部伺服器。</span>
+    </footer>
+  </div>
+
+  <script src="./predictor.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
