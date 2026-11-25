@@ -2,7 +2,7 @@
   'use strict';
 
   // ============================================================================
-  // 核心演算法（逐字保留常數與位元運算，嚴禁更動）
+  // 核心演算法（逐字保留常數與位元運算，並加入 eggSlotHash 號位抽籤）
   // ============================================================================
   const SHINY_RATE = 1 / 512;
   const SHINY_PARENT_RATE = 1 / 16;
@@ -34,6 +34,10 @@
     return eggHash(trainerSeed(save) + '|egg|' + k + '|0');
   }
 
+  function eggSlotHash(k, save) {
+    return eggHash(trainerSeed(save) + '|egg|' + k + '|1');
+  }
+
   function shinyThreshold(egg) {
     var o = 0;
     if (egg && egg.sp) o = (+egg.sp === 2) ? SHINY_PARENT_RATE : SHINY_PARENT_RATE_OLD;
@@ -60,14 +64,12 @@
   // 常數與 Popup 狀態
   // ============================================================================
   const STORAGE_KEY = 'pkc_egg_predictor_ui_v1';
-  const ID_NAME_STORAGE_KEY = 'pkc_id_to_name_v1';
   const SUPPORTED_ORIGINS = [
     'https://pokecatch-online.app'
   ];
 
-  const LIST_TOTAL_EGGS = 1000;
+  const PREDICT_LIMIT = 999;
   const LIST_PAGE_SIZE = 200;
-  const CARD_SEARCH_MAX = 8000;
 
   const TIERS = [
     {
@@ -111,23 +113,29 @@
   const uiState = {
     activeTab: 'predict', // 'predict' | 'eggs'
     filterTier: 'all', // 'all' | 'base' | 'berry' | 'parent' | 'parentBerry'
+    hideNormalAfter4: false,
     visibleCount: LIST_PAGE_SIZE,
     showDebug: false
   };
-
-  // 以 uid 為 key 的本次 Popup 記憶體快取：{ name, lv, expWidth, expLabel }
-  const domPensionCache = new Map();
-
-  // 以 mon.id 為 key 的純本地寶可夢名稱快取（同步暫存於 chrome.storage.local）
-  const idToName = Object.create(null);
-  idToName[DITTO_ID] = '百變怪';
-  let idToNameDirty = false;
 
   let currentView = 'loading'; // 'loading' | 'unsupported' | 'error' | 'ready'
   let currentErrorText = '';
   let currentState = null;
 
   const appRoot = document.getElementById('app');
+
+  // ============================================================================
+  // 本地繁體中文圖鑑查詢（零 DOM 讀取）
+  // ============================================================================
+  function dexName(id) {
+    if (id == null) return '神秘蛋';
+    var numId = +id;
+    var table = (typeof globalThis !== 'undefined' && globalThis.PC_NAMES) || (typeof window !== 'undefined' && window.PC_NAMES) || null;
+    if (table && Number.isFinite(numId) && table[numId]) {
+      return table[numId];
+    }
+    return '#' + id;
+  }
 
   // ============================================================================
   // 容錯 JSON 解析（相容雙重 JSON 字串與 { data / save / state } 外層包裹）
@@ -178,225 +186,47 @@
   }
 
   // ============================================================================
-  // 名稱清理與本地 idToName 快取
-  // ============================================================================
-  function cleanMonName(raw) {
-    if (!raw || typeof raw !== 'string') return '';
-    return raw
-      .replace(/(?:Lv|Niv|Level)\.?\s*\d+/gi, ' ')
-      .replace(/\d+(?:\.\d+)?\s*%/g, ' ')
-      .replace(/#\s*\d+/g, ' ')
-      .replace(/[✦★☆✨🍬🥚×x+]/g, ' ')
-      .replace(/\b\d+\b/g, ' ')
-      .replace(/^(?:\s*(?:領回|取回|收回|取出|移除|孵化|Récupérer|Retirer|Retrieve|Remove|Hatch)\s*)+/i, '')
-      .replace(/(?:\s*(?:領回|取回|收回|取出|移除|孵化|Récupérer|Retirer|Retrieve|Remove|Hatch)\s*)+$/i, '')
-      .replace(/^(?:領回|取回|Récupérer)\s*/gi, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
-
-  function isValidLearnedName(name) {
-    if (!name || typeof name !== 'string') return false;
-    var s = name.trim();
-    if (!s || s.length > 16) return false;
-    if (s.indexOf('?') !== -1 || s.indexOf('？') !== -1) return false;
-    if (/^(?:未知|神秘蛋|蛋|egg|pokemon|mon|null|undefined)$/i.test(s)) return false;
-    return true;
-  }
-
-  function recordIdName(id, rawName) {
-    var numId = +id;
-    if (!Number.isFinite(numId) || numId <= 0) return;
-    var cleaned = cleanMonName(rawName);
-    if (!isValidLearnedName(cleaned)) return;
-    if (idToName[numId] !== cleaned) {
-      idToName[numId] = cleaned;
-      idToNameDirty = true;
-    }
-  }
-
-  function flushIdToNameStorage() {
-    if (!idToNameDirty) return;
-    idToNameDirty = false;
-    try {
-      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-        var payload = {};
-        payload[ID_NAME_STORAGE_KEY] = idToName;
-        chrome.storage.local.set(payload);
-      }
-    } catch (e) {
-      // ignore
-    }
-  }
-
-  // ============================================================================
-  // 在遊戲分頁中執行的單次極簡純唯讀快照函式（零 DOM 修改、零寫入、零圖片、無全域變數）
+  // 在遊戲分頁中執行的極簡單行唯讀函式（完全零 DOM 查詢、零寫入）
   // ============================================================================
   function capturePageSnapshot() {
-    var rawSave = null;
     try {
-      rawSave = window.localStorage.getItem('gachamon-save-v1');
+      return window.localStorage.getItem('gachamon-save-v1');
     } catch (e) {
-      rawSave = null;
+      return null;
     }
-
-    var domMons = [];
-    try {
-      var monNodes = document.querySelectorAll('#pen-res .pen-res[data-uid], .pen-res[data-uid]');
-      for (var i = 0; i < monNodes.length; i++) {
-        var el = monNodes[i];
-        var uid = el.getAttribute('data-uid');
-        if (!uid) continue;
-
-        var expWidth = '';
-        var expLabel = '';
-        var gaugeI = el.querySelector('.pen-gauge i, [class*="gauge"] i');
-        if (gaugeI) {
-          var w = (gaugeI.style && gaugeI.style.width) ? gaugeI.style.width.trim() : '';
-          if (!w) {
-            var styleAttr = gaugeI.getAttribute('style') || '';
-            var wMatch = styleAttr.match(/width\s*:\s*([\d.]+%)/i);
-            if (wMatch) w = wMatch[1];
-          }
-          if (w) {
-            var numPct = parseFloat(w);
-            if (Number.isFinite(numPct)) {
-              var clamped = Math.max(0, Math.min(100, numPct));
-              expWidth = clamped + '%';
-              expLabel = Math.round(clamped) + '%';
-            }
-          }
-        }
-
-        var fullText = el.textContent || '';
-        var lv = null;
-        var lvMatch = fullText.match(/(?:Lv|Niv|Level)\.?\s*(\d+)/i);
-        if (lvMatch) {
-          var parsedLv = parseInt(lvMatch[1], 10);
-          if (Number.isFinite(parsedLv) && parsedLv > 0) lv = parsedLv;
-        }
-
-        var rawName = el.getAttribute('data-name') || el.getAttribute('title') || '';
-        if (!rawName) {
-          var nameEl = el.querySelector('.name, .mon-name, .pen-name, .p-name, b, strong');
-          if (nameEl && nameEl.textContent) rawName = nameEl.textContent;
-        }
-        if (!rawName) rawName = fullText;
-
-        domMons.push({
-          uid: String(uid),
-          name: rawName,
-          lv: lv,
-          expWidth: expWidth,
-          expLabel: expLabel
-        });
-      }
-    } catch (e) {
-      // ignore
-    }
-
-    var domEggNames = [];
-    try {
-      var eggNodes = document.querySelectorAll('#pen-eggs .egg-mon[title], .egg-mon[title]');
-      for (var j = 0; j < eggNodes.length; j++) {
-        var emEl = eggNodes[j];
-        var title = (emEl.getAttribute('title') || '').trim();
-        if (!title || title.indexOf('?') !== -1 || title.indexOf('？') !== -1) continue;
-        var holder = emEl.closest ? emEl.closest('[data-uid], [data-egg-uid]') : null;
-        var eUid =
-          emEl.getAttribute('data-uid') ||
-          (holder && (holder.getAttribute('data-uid') || holder.getAttribute('data-egg-uid'))) ||
-          null;
-        domEggNames.push({
-          index: j,
-          uid: eUid ? String(eUid) : null,
-          title: title
-        });
-      }
-    } catch (e) {
-      // ignore
-    }
-
-    return {
-      rawSave: rawSave,
-      domMons: domMons,
-      domEggNames: domEggNames
-    };
   }
 
-  function applyDomSnapshotToCaches(snapshot, pension) {
-    if (!snapshot) return;
-
-    var uidToId = Object.create(null);
+  // ============================================================================
+  // 存檔結構解析（極簡 parentPool + 持有蛋 + 孵化倒計時）
+  // ============================================================================
+  function parseParentPool(pension) {
     var rawMons = (pension && Array.isArray(pension.mons)) ? pension.mons : [];
-    for (var mIdx = 0; mIdx < rawMons.length; mIdx++) {
-      var entry = rawMons[mIdx];
-      var m = (entry && entry.mon && typeof entry.mon === 'object') ? entry.mon : entry;
-      if (m && m.uid != null && m.id != null) {
-        uidToId[String(m.uid)] = +m.id;
-      }
+    var pool = [];
+    for (var i = 0; i < rawMons.length; i++) {
+      var entry = rawMons[i];
+      if (!entry || typeof entry !== 'object') continue;
+      var m = (entry.mon && typeof entry.mon === 'object') ? entry.mon : entry;
+      if (!m || typeof m !== 'object') continue;
+
+      var id =
+        m.id != null ? +m.id :
+        m.speciesId != null ? +m.speciesId :
+        m.pokemonId != null ? +m.pokemonId :
+        m.dexId != null ? +m.dexId : null;
+      if (!Number.isFinite(id)) continue;
+      if (id === DITTO_ID) continue;
+      if (m.noEgg || NO_EGG_IDS.indexOf(id) !== -1) continue;
+
+      pool.push({
+        id: id,
+        shiny: !!(m.shiny || m.isShiny),
+        slotNum: pool.length + 1,
+        name: dexName(id)
+      });
     }
-    var rawEggs = (pension && Array.isArray(pension.eggs)) ? pension.eggs : [];
-    for (var eIdx = 0; eIdx < rawEggs.length; eIdx++) {
-      var eg = rawEggs[eIdx];
-      if (eg && eg.uid != null && eg.id != null) {
-        uidToId[String(eg.uid)] = +eg.id;
-      }
-    }
-
-    var domMons = Array.isArray(snapshot.domMons) ? snapshot.domMons : [];
-    for (var i = 0; i < domMons.length; i++) {
-      var dm = domMons[i];
-      if (!dm || !dm.uid) continue;
-      var uidKey = String(dm.uid);
-      var prev = domPensionCache.get(uidKey) || {
-        name: '',
-        lv: null,
-        expWidth: '',
-        expLabel: ''
-      };
-
-      if (dm.expWidth) {
-        prev.expWidth = dm.expWidth;
-        prev.expLabel = dm.expLabel || '';
-      }
-      if (dm.lv != null) {
-        prev.lv = dm.lv;
-      }
-      var cleaned = cleanMonName(dm.name || '');
-      if (isValidLearnedName(cleaned)) {
-        prev.name = cleaned;
-        if (uidToId[uidKey]) {
-          recordIdName(uidToId[uidKey], cleaned);
-        }
-      }
-      domPensionCache.set(uidKey, prev);
-    }
-
-    var domEggNames = Array.isArray(snapshot.domEggNames) ? snapshot.domEggNames : [];
-    for (var j = 0; j < domEggNames.length; j++) {
-      var de = domEggNames[j];
-      if (!de || !de.title) continue;
-      var learnedEggName = cleanMonName(de.title);
-      if (!isValidLearnedName(learnedEggName)) continue;
-
-      var matchedEggId = null;
-      if (de.uid && uidToId[String(de.uid)]) {
-        matchedEggId = uidToId[String(de.uid)];
-      } else if (typeof de.index === 'number' && de.index < rawEggs.length && rawEggs[de.index] && rawEggs[de.index].id != null) {
-        matchedEggId = +rawEggs[de.index].id;
-      }
-      if (matchedEggId) {
-        recordIdName(matchedEggId, learnedEggName);
-      }
-    }
-
-    flushIdToNameStorage();
+    return pool;
   }
 
-  // ============================================================================
-  // 存檔結構解析（save.pension.laid / eggs / mons / bx）
-  // ============================================================================
   function evaluateEgg(egg, idx, save) {
     var isShiny = eggIsShiny(egg, save);
     var th = shinyThreshold(egg);
@@ -425,29 +255,19 @@
       egg.dexId != null ? egg.dexId :
       egg.species != null ? egg.species : null);
 
-    var rawName =
-      egg && (egg.name || egg.speciesName || egg.zhName || egg.label || null);
-    if (speciesId != null && rawName) {
-      recordIdName(speciesId, String(rawName));
-    }
-
-    var uid = egg && egg.uid != null ? String(egg.uid) : null;
-    var cachedUid = uid ? domPensionCache.get(uid) : null;
-    var resolvedName =
-      (speciesId != null && idToName[speciesId]) ||
-      (cachedUid && cachedUid.name) ||
-      (rawName ? cleanMonName(String(rawName)) : '') ||
-      '神秘蛋';
+    var hatchAt = egg && typeof egg.hatchAt === 'number' && Number.isFinite(egg.hatchAt)
+      ? egg.hatchAt
+      : null;
 
     return {
       index: idx,
       egg: egg,
       k: egg && typeof egg.k === 'number' && Number.isInteger(egg.k) ? egg.k : null,
-      uid: uid,
+      uid: egg && egg.uid != null ? String(egg.uid) : null,
       laidAt: egg && egg.laidAt != null ? egg.laidAt : null,
-      hatchAt: egg && egg.hatchAt != null ? egg.hatchAt : null,
+      hatchAt: hatchAt,
       speciesId: speciesId,
-      displayName: resolvedName,
+      displayName: speciesId != null ? dexName(speciesId) : '神秘蛋',
       sp: egg && egg.sp ? +egg.sp : 0,
       bx: !!(egg && egg.bx),
       roll: roll,
@@ -457,143 +277,31 @@
     };
   }
 
-  function parsePensionMons(pension) {
-    var rawMons = (pension && Array.isArray(pension.mons)) ? pension.mons : [];
-    var dittos = [];
-    var parentPool = [];
-    var blockedMons = [];
-    var allParsed = [];
-    var warnings = [];
-    var firstMonKeys = [];
-    var firstEntryKeys = [];
-
-    for (var i = 0; i < rawMons.length; i++) {
-      var entry = rawMons[i];
-      if (!entry || typeof entry !== 'object') continue;
-      var m = (entry.mon && typeof entry.mon === 'object') ? entry.mon : entry;
-      if (!m || typeof m !== 'object') continue;
-
-      if (firstMonKeys.length === 0) {
-        firstEntryKeys = Object.keys(entry);
-        firstMonKeys = Object.keys(m);
-      }
-
-      var id =
-        m.id != null ? +m.id :
-        m.speciesId != null ? +m.speciesId :
-        m.pokemonId != null ? +m.pokemonId :
-        m.dexId != null ? +m.dexId : null;
-      if (!Number.isFinite(id)) continue;
-
-      var uid = m.uid != null ? String(m.uid) : null;
-      var cached = uid ? domPensionCache.get(uid) : null;
-      var shiny = !!(m.shiny || m.isShiny);
-
-      var rawLv =
-        m.lv != null ? +m.lv :
-        m.level != null ? +m.level :
-        m.lvl != null ? +m.lvl :
-        entry.lv != null ? +entry.lv :
-        entry.level != null ? +entry.level : null;
-      var lv = (rawLv != null && Number.isFinite(rawLv) && rawLv > 0)
-        ? rawLv
-        : (cached && cached.lv != null ? cached.lv : null);
-
-      var expWidth = (cached && cached.expWidth) ? cached.expWidth : '';
-      var expLabel = (cached && cached.expLabel) ? cached.expLabel : '';
-
-      var noEgg = !!(m.noEgg || NO_EGG_IDS.indexOf(id) !== -1);
-      var rawDomName = (cached && cached.name) || m.name || m.nickname || idToName[id] || '';
-      var domName = cleanMonName(String(rawDomName));
-      if (isValidLearnedName(domName)) {
-        recordIdName(id, domName);
-      } else if (idToName[id]) {
-        domName = idToName[id];
-      }
-
-      var candy = entry.candy != null ? entry.candy : null;
-
-      var info = {
-        id: id,
-        uid: uid,
-        shiny: shiny,
-        lv: lv,
-        expWidth: expWidth,
-        expLabel: expLabel,
-        noEgg: noEgg,
-        domName: domName || null,
-        candy: candy,
-        isDitto: id === DITTO_ID,
-        slotNum: null
-      };
-
-      allParsed.push(info);
-
-      if (id === DITTO_ID) {
-        dittos.push(info);
-      } else if (noEgg) {
-        blockedMons.push(info);
-        warnings.push((domName || '寶可夢') + ' 為不可生蛋品種');
-      } else {
-        info.slotNum = parentPool.length + 1;
-        parentPool.push(info);
-      }
+  function formatHatchCountdown(hatchAt) {
+    if (hatchAt == null || !Number.isFinite(hatchAt)) {
+      return { text: '—', ready: false };
     }
-
-    flushIdToNameStorage();
-
-    if (dittos.length >= 2 && parentPool.length === 0) {
-      warnings.push('僅放置百變怪無法生蛋');
+    var remainMs = Math.max(0, hatchAt - Date.now());
+    if (remainMs <= 0) {
+      return { text: '可孵化', ready: true };
     }
-
-    var shinyParentCount = 0;
-    for (var p = 0; p < parentPool.length; p++) {
-      if (parentPool[p].shiny) shinyParentCount++;
+    var totalMin = Math.ceil(remainMs / 60000);
+    if (totalMin < 60) {
+      return { text: totalMin + 'min', ready: false };
     }
-    var hasShinyDitto = false;
-    for (var d = 0; d < dittos.length; d++) {
-      if (dittos[d].shiny) hasShinyDitto = true;
+    var h = Math.floor(totalMin / 60);
+    var m = totalMin % 60;
+    if (m === 0) {
+      return { text: h + 'h', ready: false };
     }
-
-    var summaryParts = [];
-    if (dittos.length > 0) {
-      summaryParts.push(
-        '百變怪' +
-        (dittos.length > 1 ? '×' + dittos.length : '') +
-        (hasShinyDitto ? '(✦閃光)' : '')
-      );
-    }
-    if (parentPool.length > 0) {
-      summaryParts.push(
-        parentPool.length + '隻親代' +
-        (shinyParentCount > 0 ? '（含' + shinyParentCount + '隻閃光）' : '（無閃光）')
-      );
-    }
-    if (summaryParts.length === 0 && blockedMons.length > 0) {
-      summaryParts.push('不可生蛋×' + blockedMons.length);
-    }
-    var summaryText = summaryParts.length > 0 ? summaryParts.join(' + ') : '目前未放置親代';
-
-    return {
-      allMons: allParsed,
-      dittos: dittos,
-      parentPool: parentPool,
-      blockedMons: blockedMons,
-      shinyParentCount: shinyParentCount,
-      hasShinyDitto: hasShinyDitto,
-      summaryText: summaryText,
-      warnings: warnings,
-      firstEntryKeys: firstEntryKeys,
-      firstMonKeys: firstMonKeys
-    };
+    return { text: h + 'h ' + m + 'min', ready: false };
   }
 
-  function extractGameState(save, snapshot) {
+  function extractGameState(save) {
     var seed = trainerSeed(save);
     var pension = (save && save.pension && typeof save.pension === 'object') ? save.pension : null;
 
-    applyDomSnapshotToCaches(snapshot, pension);
-    var pensionInfo = parsePensionMons(pension);
+    var parentPool = parseParentPool(pension);
 
     var rawEggs = [];
     var eggsPath = 'save.pension.eggs';
@@ -633,21 +341,7 @@
         laid: pension.laid,
         bx: pension.bx,
         eggsCount: Array.isArray(pension.eggs) ? pension.eggs.length : 0,
-        monsCount: Array.isArray(pension.mons) ? pension.mons.length : 0,
-        firstEntryKeys: pensionInfo.firstEntryKeys,
-        firstMonKeys: pensionInfo.firstMonKeys,
-        mons: pensionInfo.allMons.map(function (m) {
-          return {
-            slot: m.isDitto ? '百變怪' : (m.slotNum ? m.slotNum + '號位' : '不可生蛋'),
-            id: m.id,
-            uid: m.uid,
-            shiny: m.shiny,
-            lv: m.lv,
-            exp: m.expLabel || undefined,
-            noEgg: m.noEgg,
-            name: m.domName || undefined
-          };
-        })
+        parentPool: parentPool
       };
     }
 
@@ -660,14 +354,14 @@
       eggsPath: eggsPath,
       eggs: evaluatedEggs,
       shinyEggs: shinyEggs,
-      pensionInfo: pensionInfo,
+      parentPool: parentPool,
       pensionDebugSummary: pensionDebugSummary,
       topKeys: Object.keys(save)
     };
   }
 
   // ============================================================================
-  // 生蛋序列預測引擎（完整保留）
+  // 生蛋序列預測引擎（固定掃描 999 顆 + 雜湊號位抽籤 egg|k|1）
   // ============================================================================
   function classifyMinTier(roll) {
     if (roll < TIERS[0].th) return TIERS[0];
@@ -677,16 +371,17 @@
     return null;
   }
 
-  function resolveParentForK(k, parentPool) {
+  function resolveParentForK(k, save, parentPool) {
     if (!parentPool || parentPool.length === 0) return null;
-    var idx = ((k % parentPool.length) + parentPool.length) % parentPool.length;
+    var roll = eggSlotHash(k, save);
+    var idx = Math.min(parentPool.length - 1, Math.floor(roll * parentPool.length));
     return parentPool[idx];
   }
 
-  function predictSequence(state, filterTier) {
+  function predictSequence(state, filterTier, hideNormalAfter4) {
     var save = state.save;
     var laid = state.laid;
-    var parentPool = state.pensionInfo ? state.pensionInfo.parentPool : [];
+    var parentPool = state.parentPool || [];
     var maxTh = TIERS[3].th;
 
     var nearest = {
@@ -697,15 +392,14 @@
     };
 
     var rows = [];
-    var earliestShiny = null;
 
-    for (var step = 0; step < CARD_SEARCH_MAX; step++) {
+    for (var step = 0; step < PREDICT_LIMIT; step++) {
       var k = laid + step;
       var roll = eggKHash(k, save);
       var minTier = roll < maxTh ? classifyMinTier(roll) : null;
-      var slotParent = resolveParentForK(k, parentPool);
+      var slotParent = resolveParentForK(k, save, parentPool);
       var slotNum = slotParent ? slotParent.slotNum : null;
-      var slotName = slotParent ? (slotParent.domName || null) : null;
+      var slotName = slotParent ? slotParent.name : null;
 
       if (minTier) {
         var hitObj = {
@@ -717,7 +411,6 @@
           slotName: slotName
         };
 
-        if (!earliestShiny) earliestShiny = hitObj;
         if (minTier.id === 'base' && !nearest.base) {
           nearest.base = hitObj;
         } else if (minTier.id === 'berry' && !nearest.berry) {
@@ -729,8 +422,8 @@
         }
       }
 
-      if (step < LIST_TOTAL_EGGS) {
-        if (filterTier === 'all' || (minTier && minTier.id === filterTier)) {
+      if (filterTier === 'all' || (minTier && minTier.id === filterTier)) {
+        if (!(hideNormalAfter4 && step >= 4 && !minTier)) {
           rows.push({
             k: k,
             step: step,
@@ -741,16 +434,6 @@
           });
         }
       }
-
-      if (
-        step + 1 >= LIST_TOTAL_EGGS &&
-        nearest.base &&
-        nearest.berry &&
-        nearest.parent &&
-        nearest.parentBerry
-      ) {
-        break;
-      }
     }
 
     var visibleLimit = Math.min(rows.length, uiState.visibleCount);
@@ -758,7 +441,6 @@
     return {
       laid: laid,
       nearest: nearest,
-      earliestShiny: earliestShiny,
       totalRows: rows.length,
       rows: rows.slice(0, visibleLimit),
       hasMore: visibleLimit < rows.length
@@ -766,26 +448,17 @@
   }
 
   // ============================================================================
-  // chrome.storage.local 偏好與本地 idToName 快取存取
+  // chrome.storage.local 偏好存取
   // ============================================================================
   function loadUiPrefs(cb) {
     try {
       if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-        chrome.storage.local.get([STORAGE_KEY, ID_NAME_STORAGE_KEY], function (res) {
+        chrome.storage.local.get([STORAGE_KEY], function (res) {
           var saved = res && res[STORAGE_KEY];
           if (saved && typeof saved === 'object') {
             if (saved.activeTab === 'predict' || saved.activeTab === 'eggs') uiState.activeTab = saved.activeTab;
             if (typeof saved.filterTier === 'string') uiState.filterTier = saved.filterTier;
-          }
-          var savedNames = res && res[ID_NAME_STORAGE_KEY];
-          if (savedNames && typeof savedNames === 'object') {
-            var keys = Object.keys(savedNames);
-            for (var i = 0; i < keys.length; i++) {
-              var k = keys[i];
-              if (isValidLearnedName(savedNames[k])) {
-                idToName[k] = savedNames[k];
-              }
-            }
+            if (typeof saved.hideNormalAfter4 === 'boolean') uiState.hideNormalAfter4 = saved.hideNormalAfter4;
           }
           cb();
         });
@@ -803,7 +476,8 @@
         var payload = {};
         payload[STORAGE_KEY] = {
           activeTab: uiState.activeTab,
-          filterTier: uiState.filterTier
+          filterTier: uiState.filterTier,
+          hideNormalAfter4: uiState.hideNormalAfter4
         };
         chrome.storage.local.set(payload);
       }
@@ -813,7 +487,7 @@
   }
 
   // ============================================================================
-  // 按需單次讀取目前分頁快照
+  // 按需單次讀取目前分頁 localStorage
   // ============================================================================
   function isSupportedGameUrl(url) {
     if (typeof url !== 'string') return false;
@@ -864,16 +538,9 @@
             return;
           }
 
-          var snapshot = results && results[0] && results[0].result ? results[0].result : null;
-          if (!snapshot) {
-            currentView = 'error';
-            currentErrorText = '未取得遊戲分頁快照資料，請稍後再點「刷新」。';
-            renderUI();
-            return;
-          }
-
-          var save = parseSaveRaw(snapshot.rawSave);
-          currentState = save ? extractGameState(save, snapshot) : null;
+          var rawSave = results && results[0] ? results[0].result : null;
+          var save = parseSaveRaw(rawSave);
+          currentState = save ? extractGameState(save) : null;
           currentView = 'ready';
           renderUI();
         }
@@ -893,68 +560,9 @@
   }
 
   function formatCardMainDist(hit) {
-    if (!hit) return '> ' + CARD_SEARCH_MAX + ' 顆';
+    if (!hit) return '> ' + PREDICT_LIMIT + ' 顆';
     if (hit.step === 0) return '下一顆是！';
     return '再過 ' + hit.step + ' 顆';
-  }
-
-  function renderMonRow(slotLabel, mon) {
-    var nameHtml = '';
-    if (mon.domName && (!mon.isDitto || mon.domName !== '百變怪')) {
-      nameHtml = '<span class="mon-name">' + escapeHtml(mon.domName) + '</span>';
-    }
-
-    var midHtml = '';
-    if (mon.lv != null || mon.expWidth) {
-      midHtml =
-        '<div class="mon-mid">' +
-        '<div class="mon-lv-row">' +
-        '<span class="mon-lv">' + (mon.lv != null ? 'Lv.' + mon.lv : '') + '</span>' +
-        (mon.expLabel ? '<span class="mon-exp-pct">' + escapeHtml(mon.expLabel) + '</span>' : '') +
-        '</div>' +
-        (mon.expWidth
-          ? '<div class="mon-gauge"><i class="mon-gauge-fill" style="width:' + escapeHtml(mon.expWidth) + ';"></i></div>'
-          : '') +
-        '</div>';
-    }
-
-    return (
-      '<div class="mon-row' + (mon.shiny ? ' shiny' : '') + '">' +
-      '<div class="mon-left">' +
-      '<span class="mon-slot">' + escapeHtml(slotLabel) + '</span>' +
-      nameHtml +
-      (mon.shiny ? '<span class="shiny-mark">✦閃光</span>' : '') +
-      '</div>' +
-      midHtml +
-      '</div>'
-    );
-  }
-
-  function renderPensionSection(pensionInfo) {
-    if (!pensionInfo) return '';
-    var html = '<div class="pension-box">';
-    html += '<div class="pension-summary">培育屋：' + escapeHtml(pensionInfo.summaryText) + '</div>';
-
-    if (pensionInfo.allMons.length > 0) {
-      html += '<div class="pension-list">';
-      for (var d = 0; d < pensionInfo.dittos.length; d++) {
-        html += renderMonRow('百變怪', pensionInfo.dittos[d]);
-      }
-      for (var p = 0; p < pensionInfo.parentPool.length; p++) {
-        var pm = pensionInfo.parentPool[p];
-        html += renderMonRow(pm.slotNum + '號位', pm);
-      }
-      for (var b = 0; b < pensionInfo.blockedMons.length; b++) {
-        html += renderMonRow('不可生蛋', pensionInfo.blockedMons[b]);
-      }
-      html += '</div>';
-    }
-
-    for (var w = 0; w < pensionInfo.warnings.length; w++) {
-      html += '<div class="pension-warn">⚠️ ' + escapeHtml(pensionInfo.warnings[w]) + '</div>';
-    }
-    html += '</div>';
-    return html;
   }
 
   function renderUI() {
@@ -970,7 +578,7 @@
 
     var state = currentState;
     var hasShinyHeld = !!(state && state.shinyEggs.length > 0);
-    var pred = state ? predictSequence(state, uiState.filterTier) : null;
+    var pred = state ? predictSequence(state, uiState.filterTier, uiState.hideNormalAfter4) : null;
 
     var html = '<div class="panel' + (hasShinyHeld ? ' has-shiny' : '') + '">';
     html +=
@@ -1004,7 +612,7 @@
       html +=
         '<div class="empty">目前分頁尚無 <code>gachamon-save-v1</code> 存檔資料<br>請進入遊戲建立或載入存檔後再點右上角「刷新」</div>';
     } else {
-      // 1. 頂部狀態列
+      // 1. 頂部狀態列（目前孵蛋數 k={laid} 與 靛莓果：已吃 / 未吃）
       html +=
         '<div class="status-bar">' +
         '<div class="status-k">目前孵蛋數 <strong>k=' + state.laid + '</strong></div>' +
@@ -1012,9 +620,6 @@
         '靛莓果：' + (state.berryActive ? '已吃' : '未吃') +
         '</div>' +
         '</div>';
-
-      // 2. 培育屋親代顯示
-      html += renderPensionSection(state.pensionInfo);
 
       // 分頁切換
       html +=
@@ -1026,7 +631,7 @@
         '</div>';
 
       if (uiState.activeTab === 'predict') {
-        // 3. 四張摘要卡
+        // 2. 四張摘要卡（共用 999 顆掃描結果）
         html += '<div class="radar-grid">';
         for (var t = 0; t < TIERS.length; t++) {
           var tier = TIERS[t];
@@ -1034,8 +639,8 @@
           var isSel = uiState.filterTier === tier.id;
           var isHot = !!(hit && hit.step === 0);
           var subText = hit
-            ? 'k=' + hit.k + (hit.slotNum != null ? ' · ' + hit.slotNum + '號位' : '')
-            : '範圍內無命中';
+            ? 'k=' + hit.k + (hit.slotNum != null ? ' · ' + hit.slotNum + '號位' + (hit.slotName ? ' ' + hit.slotName : '') : '')
+            : PREDICT_LIMIT + ' 顆內無命中';
 
           html +=
             '<button type="button" class="radar-card' +
@@ -1049,19 +654,26 @@
         }
         html += '</div>';
 
-        // 區塊標題
+        // 3. 工具列：左側「生蛋預測（999顆內）」+ 右側「隱藏第4顆以後的普通蛋」開關
         html +=
           '<div class="toolbar">' +
-          '<div class="section-title">生蛋預測（' + LIST_TOTAL_EGGS + '顆內）</div>' +
+          '<div class="toolbar-left">' +
+          '<span class="section-title">生蛋預測（' + PREDICT_LIMIT + '顆內）</span>' +
           (uiState.filterTier !== 'all'
-            ? '<button type="button" class="clear-filter-btn" id="pkc-clear-filter">顯示全部蛋序</button>'
+            ? '<button type="button" class="clear-filter-btn" id="pkc-clear-filter">全部</button>'
             : '') +
+          '</div>' +
+          '<label class="mini-switch" title="保留第 1～4 顆普通蛋與所有閃光蛋">' +
+          '<input type="checkbox" id="pkc-hide-normal"' + (uiState.hideNormalAfter4 ? ' checked' : '') + '>' +
+          '<span class="mini-switch-track"><span class="mini-switch-thumb"></span></span>' +
+          '<span class="mini-switch-text">隱藏第4顆以後的普通蛋</span>' +
+          '</label>' +
           '</div>';
 
-        // 4. 生蛋預測列表（1000 顆內，分批 200 筆）
+        // 4. 生蛋預測列表（999 顆內，分批 200 筆）
         html += '<div class="pred-list" id="pkc-pred-list">';
         if (pred.rows.length === 0) {
-          html += '<div class="empty">目前 ' + LIST_TOTAL_EGGS + ' 顆範圍內無符合條件的結果</div>';
+          html += '<div class="empty">目前 ' + PREDICT_LIMIT + ' 顆範圍內無符合條件的結果</div>';
         } else {
           for (var h = 0; h < pred.rows.length; h++) {
             var row = pred.rows[h];
@@ -1114,12 +726,12 @@
         }
         html += '</div>';
       } else {
-        // 持有蛋頁籤：清單卡片（閃光蛋加金框與 ✨ 閃光 標籤）
+        // 持有蛋頁籤：清單卡片（左側編號/繁中名稱/k與親代來源 + 右側精確到分鐘孵化倒計時）
         html += '<div class="egg-list" id="pkc-egg-list">';
         if (state.eggs.length === 0) {
           html += '<div class="empty">目前沒有持有任何蛋</div>';
         } else {
-          var parentPool = state.pensionInfo ? state.pensionInfo.parentPool : [];
+          var parentPool = state.parentPool || [];
           for (var eIdx = 0; eIdx < state.eggs.length; eIdx++) {
             var eg = state.eggs[eIdx];
             var kText = eg.k != null ? 'k=' + eg.k : eg.method;
@@ -1129,14 +741,14 @@
                 : eg.sp
                   ? (eg.bx ? '吃果舊版閃光親代' : '舊版閃光親代')
                   : (eg.bx ? '吃果普通親代' : '普通親代');
-            var slotParent = eg.k != null ? resolveParentForK(eg.k, parentPool) : null;
+            var slotParent = eg.k != null ? resolveParentForK(eg.k, state.save, parentPool) : null;
             var sourceParts = [kText];
             if (slotParent) {
-              sourceParts.push(
-                slotParent.slotNum + '號位' + (slotParent.domName ? ' ' + slotParent.domName : '')
-              );
+              sourceParts.push(slotParent.slotNum + '號位 ' + slotParent.name);
             }
             sourceParts.push(parentCond);
+
+            var cd = formatHatchCountdown(eg.hatchAt);
 
             html +=
               '<div class="egg-card' + (eg.isShiny ? ' shiny' : '') + '">' +
@@ -1148,6 +760,9 @@
               '</div>' +
               '<div class="egg-meta">' + escapeHtml(sourceParts.join(' · ')) + '</div>' +
               '</div>' +
+              '<div class="egg-countdown' + (cd.ready ? ' ready' : '') + '">' +
+              escapeHtml(cd.text) +
+              '</div>' +
               '</div>';
           }
         }
@@ -1155,21 +770,11 @@
       }
 
       if (uiState.showDebug) {
-        var firstMonKeysText =
-          state.pensionInfo && state.pensionInfo.firstMonKeys && state.pensionInfo.firstMonKeys.length > 0
-            ? state.pensionInfo.firstMonKeys.join(', ')
-            : '（無親代資料）';
-        var firstEntryKeysText =
-          state.pensionInfo && state.pensionInfo.firstEntryKeys && state.pensionInfo.firstEntryKeys.length > 0
-            ? state.pensionInfo.firstEntryKeys.join(', ')
-            : '（無親代資料）';
         html +=
           '<div class="debug-box">' +
           '<strong>Seed (trainerSeed):</strong> ' + escapeHtml(state.seed) + '<br>' +
           '<strong>k 來源:</strong> ' + escapeHtml(state.kSource) + '<br>' +
           '<strong>Object.keys(save):</strong> ' + escapeHtml(state.topKeys.join(', ')) + '<br>' +
-          '<strong>Object.keys(pension.mons[0]):</strong> ' + escapeHtml(firstEntryKeysText) + '<br>' +
-          '<strong>Object.keys(mon):</strong> ' + escapeHtml(firstMonKeysText) + '<br>' +
           '<strong>save.pension 摘要:</strong><br>' +
           escapeHtml(JSON.stringify(state.pensionDebugSummary, null, 2)) +
           '</div>';
@@ -1179,7 +784,7 @@
     html += '</div>'; // .body
     html +=
       '<div class="footer">' +
-      '<span>' + (state ? 'Seed: ' + escapeHtml(state.seed) : '純 Popup 按需唯讀 · 零網路請求') + '</span>' +
+      '<span>' + (state ? 'Seed: ' + escapeHtml(state.seed) : '純 Popup 零 DOM 查詢 · 零網路請求') + '</span>' +
       (state
         ? '<button type="button" class="link-btn" id="pkc-toggle-debug">' + (uiState.showDebug ? '收起除錯資訊' : '除錯資訊') + '</button>'
         : '') +
@@ -1242,17 +847,27 @@
       });
     }
 
+    var hideNormalCheckbox = document.getElementById('pkc-hide-normal');
+    if (hideNormalCheckbox) {
+      hideNormalCheckbox.addEventListener('change', function () {
+        uiState.hideNormalAfter4 = !!this.checked;
+        uiState.visibleCount = LIST_PAGE_SIZE;
+        saveUiPrefs();
+        renderUI();
+      });
+    }
+
     var loadMoreBtn = document.getElementById('pkc-load-more');
     if (loadMoreBtn) {
       loadMoreBtn.addEventListener('click', function (e) {
         e.stopPropagation();
-        uiState.visibleCount = Math.min(LIST_TOTAL_EGGS, uiState.visibleCount + LIST_PAGE_SIZE);
+        uiState.visibleCount = Math.min(PREDICT_LIMIT, uiState.visibleCount + LIST_PAGE_SIZE);
         renderUI();
       });
     }
   }
 
-  // 啟動入口：先載入本地快取，再單次唯讀目前分頁快照
+  // 啟動入口：載入偏好後單次唯讀目前分頁 localStorage
   loadUiPrefs(function () {
     fetchSnapshotFromActiveTab();
   });
